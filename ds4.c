@@ -60468,6 +60468,9 @@ static void presence_sync(ds4_session *s) {
 static bool ds4_session_presence_apply(ds4_session *s, float *logits,
                                        const int *extra, int n_extra) {
     if (!s || s->presence.penalty == 0.0f) return false;
+    /* Restore before syncing: a rewind rebuilds the set, and the row of an
+     * unrestored apply could then never be put back. */
+    presence_restore(&s->presence);
     presence_sync(s);
     return presence_apply(&s->presence, logits, extra, n_extra);
 }
