@@ -62,6 +62,7 @@ currently has resident) and stops it again after a period of inactivity.
 | `DS4_WORKDIR` | `DS4_REPO_DIR` | cwd for `ds4-server` when it differs from the repo (bundled installs: the dir holding `metal/`) |
 | `DS4_BINARY` | `$DS4_REPO_DIR/ds4-server` | Path of the `ds4-server` binary |
 | `DS4_LOG_DIR` | `$DS4_REPO_DIR/logs` | Directory for `ds4-server.log` |
+| `DS4_STATE_DIR` | `~/.unsloth/engines` (the log dir if that does not exist) | Directory for `ds4-state.json`, which holds the ctx set through `POST /admin/config`; at startup it overrides `DS4_CTX` |
 | `DS4_MODEL_FILE` | `ds4flash.gguf` | `-m` argument, relative to `DS4_WORKDIR` (or an absolute path). The symlink points at Swift 1.5 (`gguf/Swift1.5-Qwen3.8-Flash-Next-Q2.gguf`) since 2026-09-25; see `docs-local/10-model-swift15.md` |
 | `DS4_MODEL_ALIAS` | derived | Alias base for the listed model ids. Default: `realpath` of the model file, basename, minus `.gguf` and a trailing quant tag (`-Q2`, `-Q4_K_M`, `-Q8_0`), lowercased (`swift1.5-qwen3.8-flash-next` for the Swift file, `qwen3.8-flash-next` for the plain one) |
 | `DS4_CTX` | `65536` (code default; this install's plist sets it to `131072`) | `--ctx` |
@@ -108,6 +109,27 @@ logs go to stdout (captured by launchd into
 - `POST /admin/start` — force-start `ds4-server` now (same cold-start path
   as a proxied request, including the oMLX unload step). Blocks until
   ready or returns `503` with the log tail on failure.
+
+- `GET /admin/config` — `{"ctx", "ctx_active", "ctx_min": 4096, "ctx_max":
+  262144, "pending_restart"}`. `ctx_active` is the ctx of the running
+  `ds4-server`, or `null` when it is stopped.
+- `POST /admin/config {"ctx": N}` — validates `N` (integer, 4096..262144,
+  rounded to a multiple of 256), persists it to `ds4-state.json`, and answers
+  with the config above plus `applied`: `next_start` (not running),
+  `restarted` (running and idle: stopped gracefully, not pre-warmed, the next
+  request respawns it with the new ctx), `after_current_requests` (requests
+  in flight: `pending_restart` is true and it is stopped once they finish) or
+  `unchanged` (already running with that ctx).
+
+### `timings`
+
+For chat and completions, the final SSE usage chunk (`"choices": []`) and
+non-streaming JSON bodies carry a llama.cpp-style top-level `timings` object:
+`prompt_n` (prompt tokens minus cached), `prompt_ms` (time to first content),
+`prompt_per_second`, `predicted_n`, `predicted_ms` (first content to end),
+`predicted_per_second`, `cache_n`. It is omitted when usage is missing.
+Non-streaming bodies cannot split the phases, so both use the whole request
+time.
 
 ### `stats`
 

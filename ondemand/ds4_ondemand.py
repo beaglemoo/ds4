@@ -62,6 +62,13 @@ DS4_VISION_FILE = os.environ.get(
     "DS4_VISION_FILE", "gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf"
 )
 DS4_CTX = os.environ.get("DS4_CTX", "65536")
+# Runtime-adjustable context window (POST /admin/config). ds4-server has no
+# hard --ctx cap (ds4_server.c only parses an int; the model's rope_orig_ctx
+# is 262144), so 262144 is the ceiling offered; 4096 is a sane floor.
+CTX_MIN = 4096
+CTX_MAX = 262144
+CTX_STEP = 256
+CTX_DEFAULT = 65536
 DS4_PREFILL_CHUNK = os.environ.get("DS4_PREFILL_CHUNK", "1024")
 
 DS4_START_TIMEOUT = float(os.environ.get("DS4_START_TIMEOUT", "120"))
@@ -76,6 +83,17 @@ DS4_DEBUG = os.environ.get("DS4_DEBUG", "0") != "0"
 
 LOGS_DIR = Path(os.environ.get("DS4_LOG_DIR") or (DS4_REPO_DIR / "logs"))
 DS4_LOG_PATH = LOGS_DIR / "ds4-server.log"
+
+
+def _default_state_dir() -> Path:
+    explicit = os.environ.get("DS4_STATE_DIR")
+    if explicit:
+        return Path(os.path.expanduser(explicit))
+    engines = Path.home() / ".unsloth" / "engines"
+    return engines if engines.is_dir() else LOGS_DIR
+
+
+DS4_STATE_PATH = _default_state_dir() / "ds4-state.json"
 
 # ds4-server only recognises these ids for its thinking-mode aliases, so every
 # accepted id is mapped onto them (LEGACY_ALIAS_BASE + suffix) before the
@@ -317,6 +335,57 @@ class ModelIdRewriter:
 # --------------------------------------------------------------------------
 
 
+def _cached_tokens(usage: dict) -> int | None:
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict) and isinstance(details.get("cached_tokens"), int):
+        return details["cached_tokens"]
+    return None
+
+
+class TimingsSseFilter:
+    """Line-based pass-through for chat/completions SSE that feeds the tracker
+    and adds a top-level `timings` object to the final usage chunk
+    (`"choices": []` plus `"usage"`). Only partial lines are held back, so no
+    event is delayed; every other line is forwarded byte for byte."""
+
+    def __init__(self, tracker: StreamTracker) -> None:
+        self.tracker = tracker
+        self.buf = b""
+
+    def feed(self, chunk: bytes) -> bytes:
+        self.buf += chunk
+        idx = self.buf.rfind(b"\n")
+        if idx < 0:
+            return b""
+        block, self.buf = self.buf[: idx + 1], self.buf[idx + 1 :]
+        return b"".join(self._line(line) for line in block.splitlines(keepends=True))
+
+    def flush(self) -> bytes:
+        out, self.buf = self.buf, b""
+        return self._line(out) if out else b""
+
+    def _line(self, line: bytes) -> bytes:
+        try:
+            self.tracker.feed_sse(line if line.endswith(b"\n") else line + b"\n")
+        except Exception as e:
+            log(f"stats: parse failed (non-fatal): {e}")
+        if not line.startswith(b"data:") or b'"usage"' not in line:
+            return line
+        try:
+            obj = json.loads(line[len(b"data:") :])
+            if not isinstance(obj, dict) or obj.get("choices") != [] or not obj.get("usage"):
+                return line
+            timings = self.tracker.timings()
+            if timings is None:
+                return line
+            obj["timings"] = timings
+            ending = line[len(line.rstrip(b"\r\n")) :]
+            return b"data: " + json.dumps(obj, separators=(",", ":")).encode() + ending
+        except Exception as e:
+            log(f"timings: injection failed (non-fatal): {e}")
+            return line
+
+
 class StreamTracker:
     """Tracks token throughput for a single proxied request, from the moment
     it is dispatched to ds4-server until it finishes. Handles both SSE
@@ -331,6 +400,7 @@ class StreamTracker:
         self.gen_tokens = 0
         self.prompt_tokens: int | None = None
         self.completion_tokens: int | None = None
+        self.cached_tokens: int | None = None
         self._sse_buffer = b""
         self._pending_event: str | None = None
 
@@ -340,11 +410,18 @@ class StreamTracker:
             self.first_delta_time = now
         self.gen_tokens += 1
 
-    def note_usage(self, prompt_tokens: int | None, completion_tokens: int | None) -> None:
+    def note_usage(
+        self,
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
+        cached_tokens: int | None = None,
+    ) -> None:
         if prompt_tokens is not None:
             self.prompt_tokens = prompt_tokens
         if completion_tokens is not None:
             self.completion_tokens = completion_tokens
+        if cached_tokens is not None:
+            self.cached_tokens = cached_tokens
 
     def feed_sse(self, chunk: bytes) -> None:
         """Parse SSE lines out of a raw byte chunk, purely for stats. Never
@@ -382,7 +459,11 @@ class StreamTracker:
                     self.note_content_delta()
             usage = obj.get("usage")
             if usage:
-                self.note_usage(usage.get("prompt_tokens"), usage.get("completion_tokens"))
+                self.note_usage(
+                    usage.get("prompt_tokens"),
+                    usage.get("completion_tokens"),
+                    _cached_tokens(usage),
+                )
         elif self.route == "responses":
             if event == "response.output_text.delta" and obj.get("delta"):
                 self.note_content_delta()
@@ -410,7 +491,11 @@ class StreamTracker:
         obj = json.loads(raw)
         if self.route in ("chat", "completions"):
             usage = obj.get("usage") or {}
-            self.note_usage(usage.get("prompt_tokens"), usage.get("completion_tokens"))
+            self.note_usage(
+                usage.get("prompt_tokens"),
+                usage.get("completion_tokens"),
+                _cached_tokens(usage),
+            )
         else:  # responses, messages
             usage = obj.get("usage") or {}
             self.note_usage(usage.get("input_tokens"), usage.get("output_tokens"))
@@ -431,6 +516,31 @@ class StreamTracker:
             "gen_tps": gen_tps,
             "elapsed_s": now - self.start,
             "phase": "decode",
+        }
+
+    def timings(self, end: float | None = None) -> dict | None:
+        """llama.cpp-style per-request timings for the final usage chunk or a
+        non-streaming body. None when the usage numbers are missing. A request
+        with no content delta (non-streaming) falls back to the whole request
+        duration for both phases, like finalize() does."""
+        if self.prompt_tokens is None or self.completion_tokens is None:
+            return None
+        end = time.monotonic() if end is None else end
+        first = self.first_delta_time if self.first_delta_time is not None else self.start
+        cached = min(max(self.cached_tokens or 0, 0), self.prompt_tokens)
+        prompt_n = self.prompt_tokens - cached
+        prompt_s = (first if self.first_delta_time is not None else end) - self.start
+        predicted_s = end - first
+        return {
+            "prompt_n": prompt_n,
+            "prompt_ms": prompt_s * 1000.0,
+            "prompt_per_second": prompt_n / prompt_s if prompt_s > 0 else 0.0,
+            "predicted_n": self.completion_tokens,
+            "predicted_ms": predicted_s * 1000.0,
+            "predicted_per_second": (
+                self.completion_tokens / predicted_s if predicted_s > 0 else 0.0
+            ),
+            "cache_n": cached,
         }
 
     def finalize(self) -> dict:
@@ -510,6 +620,60 @@ class ServerStartError(Exception):
     pass
 
 
+def parse_env_ctx(raw) -> int:
+    try:
+        value = int(str(raw).strip())
+        if value <= 0:
+            raise ValueError("not positive")
+        return value
+    except (TypeError, ValueError):
+        log(f"DS4_CTX={raw!r} is not a positive integer, using {CTX_DEFAULT}")
+        return CTX_DEFAULT
+
+
+def normalize_ctx(value) -> int:
+    """Validates a requested ctx and rounds it to the nearest multiple of 256.
+    Raises ValueError with a client-facing message."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("ctx must be an integer")
+    if value < CTX_MIN or value > CTX_MAX:
+        raise ValueError(f"ctx must be between {CTX_MIN} and {CTX_MAX}")
+    return (value + CTX_STEP // 2) // CTX_STEP * CTX_STEP
+
+
+def load_persisted_ctx() -> int | None:
+    try:
+        data = json.loads(DS4_STATE_PATH.read_text())
+        return normalize_ctx(data["ctx"])
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log(f"ignoring persisted ctx in {DS4_STATE_PATH}: {e}")
+        return None
+
+
+def save_persisted_ctx(ctx: int) -> None:
+    try:
+        data = json.loads(DS4_STATE_PATH.read_text())
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    data["ctx"] = ctx
+    DS4_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = DS4_STATE_PATH.with_name(DS4_STATE_PATH.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, DS4_STATE_PATH)
+
+
+def apply_persisted_ctx() -> None:
+    """Startup: the persisted value overrides DS4_CTX."""
+    persisted = load_persisted_ctx()
+    if persisted is not None:
+        state.ctx = persisted
+        log(f"ctx {persisted} loaded from {DS4_STATE_PATH}")
+
+
 class State:
     def __init__(self) -> None:
         self.process: asyncio.subprocess.Process | None = None
@@ -521,6 +685,10 @@ class State:
         self.http_client: httpx.AsyncClient | None = None
         self.idle_task: asyncio.Task | None = None
         self.stats = Stats()
+        self.ctx = parse_env_ctx(DS4_CTX)
+        self.ctx_active: int | None = None
+        self.pending_restart = False
+        self.pending_task: asyncio.Task | None = None
 
 
 state = State()
@@ -566,12 +734,13 @@ async def _spawn() -> asyncio.subprocess.Process:
         raise ServerStartError(f"ds4-server binary not found: {DS4_BINARY}")
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     logf = open(DS4_LOG_PATH, "a", buffering=1)
+    ctx = state.ctx
     args = [
         str(DS4_BINARY),
         "-m",
         DS4_MODEL_FILE,
         "--ctx",
-        str(DS4_CTX),
+        str(ctx),
         "--prefill-chunk",
         str(DS4_PREFILL_CHUNK),
         "--mtp",
@@ -596,6 +765,7 @@ async def _spawn() -> asyncio.subprocess.Process:
         )
     finally:
         logf.close()
+    state.ctx_active = ctx
     return proc
 
 
@@ -641,6 +811,9 @@ async def _stop_locked() -> None:
     state.process = None
     state.ready = False
     state.start_time = None
+    state.ctx_active = None
+    # The next spawn reads state.ctx, so any stop applies a pending ctx change.
+    state.pending_restart = False
 
 
 async def stop_ds4_server() -> None:
@@ -663,6 +836,7 @@ async def ensure_started() -> None:
             )
             state.process = None
             state.ready = False
+            state.ctx_active = None
 
         log("cold start requested: unloading oMLX models before starting ds4-server")
         await _unload_omlx_models()
@@ -671,6 +845,8 @@ async def ensure_started() -> None:
         proc = await _spawn()
         state.process = proc
         state.start_time = time.monotonic()
+        # A ctx change that raced the spawn leaves the child on the old value.
+        state.pending_restart = state.ctx != state.ctx_active
 
         ok, err = await _wait_ready(DS4_START_TIMEOUT)
         if not ok:
@@ -679,6 +855,7 @@ async def ensure_started() -> None:
             state.process = None
             state.ready = False
             state.start_time = None
+            state.ctx_active = None
             tail = _tail_log()
             raise ServerStartError(
                 f"ds4-server failed to become ready ({err}). Log tail:\n{tail}"
@@ -696,7 +873,10 @@ async def idle_watcher() -> None:
         await asyncio.sleep(5)
         try:
             async with state.lock:
-                if state.ready and state.in_flight == 0:
+                if state.ready and state.in_flight == 0 and state.pending_restart:
+                    log("applying pending ctx change; stopping ds4-server")
+                    await _stop_locked()
+                elif state.ready and state.in_flight == 0:
                     idle_for = time.monotonic() - state.last_activity
                     if idle_for >= DS4_IDLE_SECONDS:
                         log(
@@ -710,6 +890,41 @@ async def idle_watcher() -> None:
             log(f"idle watcher error (non-fatal): {e}")
 
 
+def _server_alive() -> bool:
+    return state.process is not None and state.process.returncode is None
+
+
+async def _apply_pending_restart() -> None:
+    """Deferred half of POST /admin/config: stop once the last in-flight
+    request is done, so the next request respawns with the new ctx. Never
+    pre-warms (the model is ~41 GiB)."""
+    async with state.lock:
+        if state.in_flight != 0 or not state.pending_restart:
+            return
+        if _server_alive():
+            log(f"in-flight requests finished; stopping ds4-server to apply ctx {state.ctx}")
+            await _stop_locked()
+        else:
+            state.pending_restart = False
+
+
+def _kick_pending_restart() -> None:
+    """Call right after an in_flight decrement. Runs as a task so the stop's
+    SIGTERM wait never holds a client response open."""
+    if state.pending_restart and state.in_flight == 0:
+        state.pending_task = asyncio.create_task(_apply_pending_restart())
+
+
+def _config_payload() -> dict:
+    return {
+        "ctx": state.ctx,
+        "ctx_active": state.ctx_active if _server_alive() else None,
+        "ctx_min": CTX_MIN,
+        "ctx_max": CTX_MAX,
+        "pending_restart": state.pending_restart,
+    }
+
+
 # --------------------------------------------------------------------------
 # FastAPI app
 # --------------------------------------------------------------------------
@@ -717,6 +932,7 @@ async def idle_watcher() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    apply_persisted_ctx()
     state.http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=5.0, read=None, write=30.0, pool=5.0)
     )
@@ -787,7 +1003,10 @@ async def admin_status():
             "ds4_model_file": DS4_MODEL_FILE,
             "model_alias": DS4_MODEL_ALIAS,
             "ds4_vision_file": DS4_VISION_FILE,
-            "ds4_ctx": DS4_CTX,
+            "ds4_ctx": state.ctx,
+            "ctx": state.ctx,
+            "ctx_active": state.ctx_active if _server_alive() else None,
+            "pending_restart": state.pending_restart,
             "ds4_prefill_chunk": DS4_PREFILL_CHUNK,
             "ds4_start_timeout": DS4_START_TIMEOUT,
             "ds4_idle_seconds": DS4_IDLE_SECONDS,
@@ -796,6 +1015,56 @@ async def admin_status():
             "sampling_defaults": SAMPLING_SETS,
         },
     }
+
+
+@app.get("/admin/config")
+async def admin_config_get():
+    return _config_payload()
+
+
+@app.post("/admin/config")
+async def admin_config_set(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="body must be JSON")
+    if not isinstance(body, dict) or "ctx" not in body:
+        raise HTTPException(status_code=400, detail='body must be {"ctx": <int>}')
+    try:
+        ctx = normalize_ctx(body["ctx"])
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        save_persisted_ctx(ctx)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"could not persist ctx: {e}")
+    state.ctx = ctx
+    log(f"ctx set to {ctx} (persisted to {DS4_STATE_PATH})")
+
+    if not _server_alive():
+        state.pending_restart = False
+        applied = "next_start"
+    elif state.ctx_active == ctx:
+        state.pending_restart = False
+        applied = "unchanged"
+    elif state.in_flight > 0:
+        state.pending_restart = True
+        applied = "after_current_requests"
+    else:
+        # Checked before taking the lock: a cold start holds it for up to
+        # DS4_START_TIMEOUT, and that start already counts as in-flight.
+        async with state.lock:
+            if not _server_alive():
+                state.pending_restart = False
+                applied = "next_start"
+            elif state.in_flight > 0:
+                state.pending_restart = True
+                applied = "after_current_requests"
+            else:
+                log(f"ctx change to {ctx} while idle; stopping ds4-server")
+                await _stop_locked()
+                applied = "restarted"
+    return {**_config_payload(), "applied": applied}
 
 
 @app.post("/admin/stop")
@@ -893,16 +1162,37 @@ async def proxy(full_path: str, request: Request):
         if not started_stream:
             state.in_flight -= 1
             state.last_activity = time.monotonic()
+            _kick_pending_restart()
 
     resp_headers = _filtered_headers(upstream.headers)
     is_sse = upstream.headers.get("content-type", "").startswith("text/event-stream")
     upstream_is_error = upstream.status_code >= 400
     non_stream_buffer = bytearray() if (tracker is not None and not is_sse) else None
+    timings_route = route_key in ("chat", "completions") and not upstream_is_error
+    sse_filter = (
+        TimingsSseFilter(tracker)
+        if (tracker is not None and is_sse and timings_route)
+        else None
+    )
+
+    def add_timings(raw: bytes) -> bytes:
+        """Non-streaming chat/completions body: parse usage, add timings."""
+        tracker.parse_full_body(raw)
+        timings = tracker.timings()
+        if timings is None:
+            return raw
+        obj = json.loads(raw)
+        if not isinstance(obj, dict):
+            return raw
+        obj["timings"] = timings
+        return json.dumps(obj, separators=(",", ":")).encode()
 
     async def body_iter():
         try:
             async for chunk in upstream.aiter_bytes():
-                if tracker is not None:
+                if sse_filter is not None:
+                    chunk = sse_filter.feed(chunk)
+                elif tracker is not None:
                     try:
                         if is_sse:
                             tracker.feed_sse(chunk)
@@ -910,7 +1200,23 @@ async def proxy(full_path: str, request: Request):
                             non_stream_buffer.extend(chunk)
                     except Exception as e:
                         log(f"stats: parse failed for {full_path} (non-fatal): {e}")
-                yield rewriter.feed(chunk) if rewriter is not None else chunk
+                if non_stream_buffer is not None and timings_route:
+                    continue  # held until the whole body can carry timings
+                if chunk:
+                    yield rewriter.feed(chunk) if rewriter is not None else chunk
+            if sse_filter is not None:
+                tail = sse_filter.flush()
+                if tail:
+                    yield rewriter.feed(tail) if rewriter is not None else tail
+            elif non_stream_buffer is not None and timings_route:
+                raw = bytes(non_stream_buffer)
+                try:
+                    raw = add_timings(raw)
+                    non_stream_buffer.clear()  # already parsed for stats
+                except Exception as e:
+                    log(f"timings: full-body injection failed for {full_path} (non-fatal): {e}")
+                if raw:
+                    yield rewriter.feed(raw) if rewriter is not None else raw
             if rewriter is not None:
                 tail = rewriter.flush()
                 if tail:
@@ -919,9 +1225,10 @@ async def proxy(full_path: str, request: Request):
             await upstream.aclose()
             state.in_flight -= 1
             state.last_activity = time.monotonic()
+            _kick_pending_restart()
             if tracker is not None:
                 error = upstream_is_error
-                if not error and non_stream_buffer is not None:
+                if not error and non_stream_buffer:
                     try:
                         tracker.parse_full_body(bytes(non_stream_buffer))
                     except Exception as e:
