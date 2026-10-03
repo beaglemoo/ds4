@@ -21,7 +21,12 @@ currently has resident) and stops it again after a period of inactivity.
   exposed directly.
 - `GET /v1/models` answers instantly from a static list of the three model
   aliases, without starting `ds4-server`, so model pickers work while it is
-  cold.
+  cold. The ids are derived from the served GGUF (see `DS4_MODEL_ALIAS`):
+  `<base>`, `<base>-chat` (thinking off) and `<base>-reasoner` (thinking on).
+  The legacy `qwen3.8-flash-next`, `-chat` and `-reasoner` ids are still
+  accepted but not listed. The launcher rewrites the request `model` to the
+  legacy id `ds4-server` understands, and the response reports the id the
+  client asked for.
 - Every other `/v1/*` path (`/v1/chat/completions`, `/v1/completions`,
   `/v1/responses`, `/v1/messages`) is proxied to `ds4-server`, starting it
   first if needed. Streaming (SSE) responses are passed through chunk by
@@ -58,6 +63,7 @@ currently has resident) and stops it again after a period of inactivity.
 | `DS4_BINARY` | `$DS4_REPO_DIR/ds4-server` | Path of the `ds4-server` binary |
 | `DS4_LOG_DIR` | `$DS4_REPO_DIR/logs` | Directory for `ds4-server.log` |
 | `DS4_MODEL_FILE` | `ds4flash.gguf` | `-m` argument, relative to `DS4_WORKDIR` (or an absolute path). The symlink points at Swift 1.5 (`gguf/Swift1.5-Qwen3.8-Flash-Next-Q2.gguf`) since 2026-09-25; see `docs-local/10-model-swift15.md` |
+| `DS4_MODEL_ALIAS` | derived | Alias base for the listed model ids. Default: `realpath` of the model file, basename, minus `.gguf` and a trailing quant tag (`-Q2`, `-Q4_K_M`, `-Q8_0`), lowercased (`swift1.5-qwen3.8-flash-next` for the Swift file, `qwen3.8-flash-next` for the plain one) |
 | `DS4_CTX` | `65536` (code default; this install's plist sets it to `131072`) | `--ctx` |
 | `DS4_PREFILL_CHUNK` | `1024` | `--prefill-chunk` |
 | `DS4_START_TIMEOUT` | `120` | Seconds to wait for `/v1/models` to return 200 before giving up |

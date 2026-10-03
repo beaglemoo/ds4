@@ -77,11 +77,64 @@ DS4_DEBUG = os.environ.get("DS4_DEBUG", "0") != "0"
 LOGS_DIR = Path(os.environ.get("DS4_LOG_DIR") or (DS4_REPO_DIR / "logs"))
 DS4_LOG_PATH = LOGS_DIR / "ds4-server.log"
 
-STATIC_MODELS = [
-    "qwen3.8-flash-next",
-    "qwen3.8-flash-next-chat",
-    "qwen3.8-flash-next-reasoner",
-]
+# ds4-server only recognises these ids for its thinking-mode aliases, so every
+# accepted id is mapped onto them (LEGACY_ALIAS_BASE + suffix) before the
+# request is forwarded, and the model id in the response is mapped back.
+LEGACY_ALIAS_BASE = "qwen3.8-flash-next"
+MODE_SUFFIXES = ("", "-chat", "-reasoner")
+
+# Trailing quantisation tag of a GGUF file stem: -Q2, -Q4_K_M, -Q8_0, -IQ2_XXS,
+# -UD-Q4_K_XL, -BF16, -F16 ...
+QUANT_SUFFIX_RE = re.compile(
+    r"-(?:ud-)?(?:i?q\d+(?:_[a-z0-9]+)*|bf16|f16|f32)$", re.IGNORECASE
+)
+
+
+def derive_alias_base(model_file: str, workdir: Path | None = None) -> str:
+    """Alias base from the file that is actually served: realpath, basename,
+    minus .gguf and the trailing quant tag, lowercased."""
+    path = Path(os.path.expanduser(model_file))
+    if not path.is_absolute() and workdir is not None:
+        path = workdir / path
+    stem = os.path.basename(os.path.realpath(path))
+    if stem.lower().endswith(".gguf"):
+        stem = stem[: -len(".gguf")]
+    stem = QUANT_SUFFIX_RE.sub("", stem).strip().lower()
+    return stem or LEGACY_ALIAS_BASE
+
+
+def model_alias_base(model_file: str, override: str | None, workdir: Path | None = None) -> str:
+    """DS4_MODEL_ALIAS (env or [ds4] alias in engines.toml) wins over the
+    name derived from the model file."""
+    explicit = (override or "").strip().lower()
+    return explicit or derive_alias_base(model_file, workdir)
+
+
+DS4_MODEL_ALIAS = model_alias_base(
+    DS4_MODEL_FILE, os.environ.get("DS4_MODEL_ALIAS"), DS4_WORKDIR
+)
+
+
+def listed_models(base: str) -> list[str]:
+    return [base + suffix for suffix in MODE_SUFFIXES]
+
+
+STATIC_MODELS = listed_models(DS4_MODEL_ALIAS)
+
+
+def resolve_model_alias(model, base: str | None = None) -> tuple[str, str] | None:
+    """Maps a requested model id to (mode suffix, id ds4-server understands).
+    Accepts the listed <base>, <base>-chat, <base>-reasoner and the legacy
+    qwen3.8-flash-next* ids (accepted but not listed). None for any other id,
+    which is forwarded untouched."""
+    if not isinstance(model, str):
+        return None
+    key = model.strip().lower()
+    for candidate in dict.fromkeys((base or DS4_MODEL_ALIAS, LEGACY_ALIAS_BASE)):
+        for suffix in MODE_SUFFIXES:
+            if key == candidate + suffix:
+                return suffix, LEGACY_ALIAS_BASE + suffix
+    return None
 
 # Sampling parameters recommended by the Qwen3.8-Flash-Next model card ("Best
 # Practices": non-thinking mode temperature 0.7 / top_p 0.8 / top_k 20,
@@ -207,8 +260,12 @@ SAMPLING_SETS = load_sampling_sets(DS4_SAMPLING_DEFAULTS)
 
 def sampling_defaults_for(model: str | None) -> dict:
     """ds4-server picks no-think mode from the alias suffix (-chat), and
-    thinking for every other alias, so the sampling set follows the alias."""
-    if model is not None and model.strip().lower().endswith("-chat"):
+    thinking for every other alias, so the sampling set follows the alias.
+    The listed <base>-chat and the legacy -chat id behave the same."""
+    resolved = resolve_model_alias(model)
+    if resolved is not None:
+        return SAMPLING_SETS["nothink" if resolved[0] == "-chat" else "think"]
+    if isinstance(model, str) and model.strip().lower().endswith("-chat"):
         return SAMPLING_SETS["nothink"]
     return SAMPLING_SETS["think"]
 
@@ -230,6 +287,29 @@ def apply_sampling_defaults(data: dict, route_key: str) -> list[str]:
             data[key] = value
             injected.append(key)
     return injected
+
+
+class ModelIdRewriter:
+    """Puts the requested model id back into a proxied response. ds4-server
+    echoes the id it was sent (a legacy alias); clients asked for another one.
+    Works on complete lines so SSE events are never delayed."""
+
+    def __init__(self, sent: str, requested: str) -> None:
+        self.old = b'"model":' + json.dumps(sent).encode()
+        self.new = b'"model":' + json.dumps(requested).encode()
+        self.buf = b""
+
+    def feed(self, chunk: bytes) -> bytes:
+        self.buf += chunk
+        idx = self.buf.rfind(b"\n")
+        if idx < 0:
+            return b""
+        out, self.buf = self.buf[: idx + 1], self.buf[idx + 1 :]
+        return out.replace(self.old, self.new)
+
+    def flush(self) -> bytes:
+        out, self.buf = self.buf, b""
+        return out.replace(self.old, self.new)
 
 
 # --------------------------------------------------------------------------
@@ -705,6 +785,7 @@ async def admin_status():
             "ds4_workdir": str(DS4_WORKDIR),
             "ds4_binary": str(DS4_BINARY),
             "ds4_model_file": DS4_MODEL_FILE,
+            "model_alias": DS4_MODEL_ALIAS,
             "ds4_vision_file": DS4_VISION_FILE,
             "ds4_ctx": DS4_CTX,
             "ds4_prefill_chunk": DS4_PREFILL_CHUNK,
@@ -754,6 +835,7 @@ async def proxy(full_path: str, request: Request):
     route_key = STATS_ROUTES.get(full_path)
     trackable = route_key is not None and request.method == "POST"
     tracker: StreamTracker | None = None
+    rewriter: ModelIdRewriter | None = None
     try:
         try:
             await ensure_started()
@@ -769,6 +851,11 @@ async def proxy(full_path: str, request: Request):
                 model_hint = data.get("model")
                 rewritten = False
                 injected = apply_sampling_defaults(data, route_key)
+                resolved = resolve_model_alias(model_hint)
+                if resolved is not None and resolved[1] != model_hint:
+                    data["model"] = resolved[1]
+                    rewriter = ModelIdRewriter(resolved[1], model_hint)
+                    rewritten = True
                 if injected:
                     rewritten = True
                     shown = " ".join(f"{k}={data[k]}" for k in injected)
@@ -823,7 +910,11 @@ async def proxy(full_path: str, request: Request):
                             non_stream_buffer.extend(chunk)
                     except Exception as e:
                         log(f"stats: parse failed for {full_path} (non-fatal): {e}")
-                yield chunk
+                yield rewriter.feed(chunk) if rewriter is not None else chunk
+            if rewriter is not None:
+                tail = rewriter.flush()
+                if tail:
+                    yield tail
         finally:
             await upstream.aclose()
             state.in_flight -= 1

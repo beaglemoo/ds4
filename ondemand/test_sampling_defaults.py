@@ -11,7 +11,10 @@ same interpreter and dependency set:
 
 from __future__ import annotations
 
+import asyncio
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -108,6 +111,195 @@ class SamplingDefaultsTest(unittest.TestCase):
         sets = od.load_sampling_sets(None)
         self.assertEqual(sets["think"], od.SAMPLING_THINK)
         self.assertEqual(sets["nothink"], od.SAMPLING_NOTHINK)
+
+
+class ModelAliasTest(unittest.TestCase):
+    def test_derive_from_swift_and_plain_files(self) -> None:
+        self.assertEqual(
+            od.derive_alias_base("gguf/Swift1.5-Qwen3.8-Flash-Next-Q2.gguf"),
+            "swift1.5-qwen3.8-flash-next",
+        )
+        self.assertEqual(
+            od.derive_alias_base("/x/Qwen3.8-Flash-Next-Q2.gguf"),
+            "qwen3.8-flash-next",
+        )
+
+    def test_quant_suffix_variants(self) -> None:
+        for name in (
+            "Foo-Q4_K_M.gguf",
+            "Foo-Q8_0.gguf",
+            "Foo-IQ2_XXS.gguf",
+            "Foo-UD-Q4_K_XL.gguf",
+            "Foo-BF16.gguf",
+            "Foo.gguf",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(od.derive_alias_base(name), "foo")
+
+    def test_derivation_follows_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / "gguf" / "Swift1.5-Qwen3.8-Flash-Next-Q2.gguf"
+            real.parent.mkdir()
+            real.write_bytes(b"")
+            link = Path(tmp) / "ds4flash.gguf"
+            os.symlink(real, link)
+            self.assertEqual(od.derive_alias_base(str(link)), "swift1.5-qwen3.8-flash-next")
+            self.assertEqual(
+                od.derive_alias_base("ds4flash.gguf", Path(tmp)),
+                "swift1.5-qwen3.8-flash-next",
+            )
+
+    def test_override_wins(self) -> None:
+        self.assertEqual(
+            od.model_alias_base("gguf/Swift1.5-Qwen3.8-Flash-Next-Q2.gguf", " My-Model "),
+            "my-model",
+        )
+        for empty in (None, "", "  "):
+            self.assertEqual(
+                od.model_alias_base("Qwen3.8-Flash-Next-Q2.gguf", empty),
+                "qwen3.8-flash-next",
+            )
+
+    def test_listing(self) -> None:
+        self.assertEqual(
+            od.listed_models("swift1.5-qwen3.8-flash-next"),
+            [
+                "swift1.5-qwen3.8-flash-next",
+                "swift1.5-qwen3.8-flash-next-chat",
+                "swift1.5-qwen3.8-flash-next-reasoner",
+            ],
+        )
+        old = od.STATIC_MODELS
+        od.STATIC_MODELS = od.listed_models("swift1.5-qwen3.8-flash-next")
+        try:
+            body = asyncio.run(od.list_models())
+        finally:
+            od.STATIC_MODELS = old
+        ids = [m["id"] for m in body["data"]]
+        self.assertEqual(ids, od.listed_models("swift1.5-qwen3.8-flash-next"))
+        self.assertNotIn("qwen3.8-flash-next-chat", ids)
+
+    def test_new_and_legacy_ids_map_to_server_aliases(self) -> None:
+        base = "swift1.5-qwen3.8-flash-next"
+        cases = {
+            base: ("", "qwen3.8-flash-next"),
+            base + "-chat": ("-chat", "qwen3.8-flash-next-chat"),
+            base + "-reasoner": ("-reasoner", "qwen3.8-flash-next-reasoner"),
+            "qwen3.8-flash-next": ("", "qwen3.8-flash-next"),
+            "qwen3.8-flash-next-chat": ("-chat", "qwen3.8-flash-next-chat"),
+            "qwen3.8-flash-next-reasoner": ("-reasoner", "qwen3.8-flash-next-reasoner"),
+            "Qwen3.8-Flash-Next-CHAT": ("-chat", "qwen3.8-flash-next-chat"),
+        }
+        for model, expected in cases.items():
+            with self.subTest(model=model):
+                self.assertEqual(od.resolve_model_alias(model, base), expected)
+
+    def test_unknown_ids_are_not_mapped(self) -> None:
+        for model in ("gpt-4", "swift1.5-qwen3.8-flash-next-bogus", "", None, 3):
+            with self.subTest(model=model):
+                self.assertIsNone(od.resolve_model_alias(model, "swift1.5-qwen3.8-flash-next"))
+
+    def test_plain_file_base_equals_legacy(self) -> None:
+        self.assertEqual(
+            od.resolve_model_alias("qwen3.8-flash-next-chat", "qwen3.8-flash-next"),
+            ("-chat", "qwen3.8-flash-next-chat"),
+        )
+
+    def test_presets_apply_to_new_and_legacy_names(self) -> None:
+        old = od.DS4_MODEL_ALIAS
+        od.DS4_MODEL_ALIAS = "swift1.5-qwen3.8-flash-next"
+        sets = od.SAMPLING_SETS
+        od.SAMPLING_SETS = od.load_sampling_sets(None)
+        try:
+            for model in ("swift1.5-qwen3.8-flash-next-chat", "qwen3.8-flash-next-chat"):
+                with self.subTest(model=model):
+                    self.assertEqual(od.sampling_defaults_for(model), od.SAMPLING_NOTHINK)
+            for model in (
+                "swift1.5-qwen3.8-flash-next",
+                "swift1.5-qwen3.8-flash-next-reasoner",
+                "qwen3.8-flash-next",
+                "qwen3.8-flash-next-reasoner",
+            ):
+                with self.subTest(model=model):
+                    self.assertEqual(od.sampling_defaults_for(model), od.SAMPLING_THINK)
+        finally:
+            od.DS4_MODEL_ALIAS = old
+            od.SAMPLING_SETS = sets
+
+
+class ModelIdRewriterTest(unittest.TestCase):
+    def test_sse_events_rewritten_without_delay(self) -> None:
+        rw = od.ModelIdRewriter("qwen3.8-flash-next-chat", "swift-flash-chat")
+        event = b'data: {"id":"a","model":"qwen3.8-flash-next-chat","x":1}\n\n'
+        self.assertEqual(
+            rw.feed(event),
+            b'data: {"id":"a","model":"swift-flash-chat","x":1}\n\n',
+        )
+        self.assertEqual(rw.flush(), b"")
+
+    def test_split_chunks_and_plain_json(self) -> None:
+        rw = od.ModelIdRewriter("m-old", "m-new")
+        out = rw.feed(b'data: {"model":"m-')
+        out += rw.feed(b'old"}\n\n{"model":"m-old"}')
+        out += rw.flush()
+        self.assertEqual(out, b'data: {"model":"m-new"}\n\n{"model":"m-new"}')
+
+
+class ProxyRoutingTest(unittest.TestCase):
+    """Drives the real proxy route against a mock upstream, so no ds4-server
+    (and no model) is ever started."""
+
+    def test_legacy_and_new_ids_reach_server_as_legacy_and_echo_requested(self) -> None:
+        import json
+
+        import httpx
+        from fastapi.testclient import TestClient
+
+        seen: list[dict] = []
+
+        def upstream(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            seen.append(body)
+            return httpx.Response(
+                200,
+                content=json.dumps(
+                    {"object": "chat.completion", "model": body["model"], "choices": []},
+                    separators=(",", ":"),
+                ).encode(),
+                headers={"content-type": "application/json"},
+            )
+
+        async def no_start() -> None:
+            return None
+
+        saved = (od.ensure_started, od.state.http_client, od.DS4_MODEL_ALIAS)
+        od.ensure_started = no_start
+        od.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+        od.DS4_MODEL_ALIAS = "swift1.5-qwen3.8-flash-next"
+        try:
+            client = TestClient(od.app)
+            cases = {
+                "swift1.5-qwen3.8-flash-next-chat": "qwen3.8-flash-next-chat",
+                "swift1.5-qwen3.8-flash-next-reasoner": "qwen3.8-flash-next-reasoner",
+                "swift1.5-qwen3.8-flash-next": "qwen3.8-flash-next",
+                "qwen3.8-flash-next-chat": "qwen3.8-flash-next-chat",
+                "qwen3.8-flash-next-reasoner": "qwen3.8-flash-next-reasoner",
+                "qwen3.8-flash-next": "qwen3.8-flash-next",
+            }
+            for requested, sent in cases.items():
+                with self.subTest(model=requested):
+                    seen.clear()
+                    resp = client.post(
+                        "/v1/chat/completions",
+                        json={"model": requested, "messages": []},
+                    )
+                    self.assertEqual(resp.status_code, 200)
+                    self.assertEqual(seen[0]["model"], sent)
+                    self.assertEqual(resp.json()["model"], requested)
+                    nothink = requested.endswith("-chat")
+                    self.assertEqual(seen[0]["presence_penalty"], 1.5 if nothink else 0.0)
+        finally:
+            od.ensure_started, od.state.http_client, od.DS4_MODEL_ALIAS = saved
 
 
 if __name__ == "__main__":
