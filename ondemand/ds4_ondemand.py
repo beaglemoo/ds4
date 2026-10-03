@@ -9,7 +9,7 @@
 # ///
 """On-demand launcher/proxy for DwarfStar's ds4-server.
 
-Listens on DS4_ONDEMAND_HOST:DS4_ONDEMAND_PORT (default 0.0.0.0:8001) and
+Listens on DS4_ONDEMAND_HOST:DS4_ONDEMAND_PORT (default 127.0.0.1:8001) and
 proxies everything to a ds4-server child process on 127.0.0.1:8000, starting
 it lazily on first request and stopping it after DS4_IDLE_SECONDS of no
 in-flight requests. Because ds4-server (DS4 / Qwen3.8-Flash-Next Q2, ~43 GiB
@@ -49,7 +49,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 # Configuration (all overridable via environment)
 # --------------------------------------------------------------------------
 
-DS4_ONDEMAND_HOST = os.environ.get("DS4_ONDEMAND_HOST", "0.0.0.0")
+DS4_ONDEMAND_HOST = os.environ.get("DS4_ONDEMAND_HOST", "127.0.0.1")
 DS4_ONDEMAND_PORT = int(os.environ.get("DS4_ONDEMAND_PORT", "8001"))
 
 DS4_SERVER_HOST = "127.0.0.1"  # ds4-server itself always stays loopback-only

@@ -347,6 +347,18 @@ class HoldTest(Patched):
         self.client.delete(f"/admin/hold/{a}")
         self.assertEqual(self.client.post("/admin/start").status_code, 503)
 
+    def test_status_carries_the_fields_oMLX_peer_evict_reads(self) -> None:
+        cold = self.client.get("/admin/status").json()
+        for key in ("loaded", "in_flight", "uptime_seconds", "starting"):
+            self.assertIn(key, cold)
+        self.assertIsNone(cold["uptime_seconds"])
+        od.state.process = FakeProc()
+        od.state.ready = True
+        od.state.start_time = od.time.monotonic() - 42
+        warm = self.client.get("/admin/status").json()
+        self.assertTrue(warm["loaded"])
+        self.assertGreaterEqual(warm["uptime_seconds"], 42)
+
     def test_hold_does_not_stop_a_running_server(self) -> None:
         proc = FakeProc()
         od.state.process = proc
@@ -435,6 +447,36 @@ class OmlxRepollTest(unittest.IsolatedAsyncioTestCase):
         self._client([loaded, clear], posts)
         await od._unload_omlx_models()
         self.assertEqual(posts, ["/v1/models/m1/unload"])
+
+    async def test_202_and_409_unload_replies_rely_on_the_repoll(self) -> None:
+        for status, body in ((202, {"status": "unloading"}), (409, {"detail": "loading"})):
+            with self.subTest(status=status):
+                polls = {"n": 0}
+
+                def handler(request: httpx.Request, status=status, body=body, polls=polls):
+                    if request.url.path == "/v1/models/status":
+                        polls["n"] += 1
+                        loaded = polls["n"] < 3
+                        return httpx.Response(
+                            200, json={"models": [{"id": "m1", "loaded": loaded}]}
+                        )
+                    return httpx.Response(status, json=body)
+
+                od.state.http_client = httpx.AsyncClient(
+                    transport=httpx.MockTransport(handler)
+                )
+                await od._unload_omlx_models()  # drained during the re-poll
+                self.assertGreaterEqual(polls["n"], 3)
+
+    async def test_202_with_model_still_resident_refuses(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/v1/models/status":
+                return httpx.Response(200, json={"models": [{"id": "m1", "loaded": True}]})
+            return httpx.Response(202, json={"status": "unloading"})
+
+        od.state.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with self.assertRaises(od.ServerStartError):
+            await od._unload_omlx_models()
 
     async def test_nothing_loaded_does_not_post(self) -> None:
         posts: list[str] = []
