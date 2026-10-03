@@ -707,18 +707,96 @@ def load_persisted_ctx() -> int | None:
         return None
 
 
-def save_persisted_ctx(ctx: int) -> None:
+def _read_state_file() -> dict:
     try:
         data = json.loads(DS4_STATE_PATH.read_text())
-        if not isinstance(data, dict):
-            data = {}
     except Exception:
-        data = {}
-    data["ctx"] = ctx
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_state_file(data: dict) -> None:
+    """Atomic: write a temp file in the same directory, fsync, then rename."""
     DS4_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = DS4_STATE_PATH.with_name(DS4_STATE_PATH.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    with open(tmp, "w") as f:
+        f.write(json.dumps(data, indent=2) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, DS4_STATE_PATH)
+
+
+def save_persisted_ctx(ctx: int) -> None:
+    data = _read_state_file()
+    data["ctx"] = ctx
+    _write_state_file(data)
+
+
+def persist_holds() -> None:
+    """Writes the live holds (id, reason, absolute wall-clock expiry) next to
+    the persisted ctx, so a launcher restart keeps the cold-start barrier.
+    Never raises: a failed write must not fail the hold request itself."""
+    try:
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        data = _read_state_file()
+        data["holds"] = [
+            {
+                "id": hold_id,
+                "reason": v["reason"],
+                "expires_at": now_wall + (v["expires"] - now_mono),
+            }
+            for hold_id, v in state.holds.items()
+            if v["expires"] > now_mono
+        ]
+        _write_state_file(data)
+    except Exception as e:
+        log(f"could not persist holds to {DS4_STATE_PATH}: {e}")
+
+
+def load_persisted_holds() -> dict[str, dict]:
+    """Unexpired holds from the state file, as in-memory records (monotonic
+    deadline derived from the absolute expiry)."""
+    try:
+        raw = json.loads(DS4_STATE_PATH.read_text()).get("holds")
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        log(f"ignoring persisted holds in {DS4_STATE_PATH}: {e}")
+        return {}
+    if not isinstance(raw, list):
+        return {}
+    now_wall = time.time()
+    now_mono = time.monotonic()
+    holds: dict[str, dict] = {}
+    for item in raw:
+        try:
+            hold_id = item["id"]
+            reason = item["reason"]
+            expires_at = item["expires_at"]
+            if (
+                not isinstance(hold_id, str)
+                or not hold_id
+                or not isinstance(reason, str)
+                or isinstance(expires_at, bool)
+                or not isinstance(expires_at, (int, float))
+            ):
+                continue
+            remaining = min(float(expires_at) - now_wall, HOLD_TTL_MAX)
+        except (KeyError, TypeError):
+            continue
+        if remaining > 0:
+            holds[hold_id] = {"reason": reason[:200], "expires": now_mono + remaining}
+    return holds
+
+
+def apply_persisted_holds() -> None:
+    """Startup: reload unexpired holds before any cold start can be admitted."""
+    holds = load_persisted_holds()
+    for hold_id, record in holds.items():
+        state.holds.setdefault(hold_id, record)
+    if holds:
+        log(f"{len(holds)} hold(s) reloaded from {DS4_STATE_PATH}")
 
 
 def apply_persisted_ctx() -> None:
@@ -1205,6 +1283,7 @@ def _config_payload() -> dict:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     apply_persisted_ctx()
+    apply_persisted_holds()
     state.http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=5.0, read=None, write=30.0, pool=5.0)
     )
@@ -1426,6 +1505,7 @@ async def admin_hold_create(request: Request):
     hold_id = secrets.token_hex(8)
     reason = reason.strip()[:200]
     state.holds[hold_id] = {"reason": reason, "expires": time.monotonic() + ttl}
+    persist_holds()
     log(f"hold {hold_id} created: {reason!r} ttl={ttl}s")
     return {"hold_id": hold_id}
 
@@ -1435,6 +1515,7 @@ async def admin_hold_delete(hold_id: str):
     _purge_holds()
     if state.holds.pop(hold_id, None) is None:
         raise HTTPException(status_code=404, detail="no such hold (released or expired)")
+    persist_holds()
     log(f"hold {hold_id} released")
     return {"status": "ok", "released": hold_id}
 

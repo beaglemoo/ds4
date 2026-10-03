@@ -74,6 +74,10 @@ class Patched(unittest.TestCase):
 
     def setUp(self) -> None:
         reset_state()
+        # Holds are persisted: never let a test touch the live state file.
+        self._state_tmp = tempfile.TemporaryDirectory()
+        self._saved_state_path = od.DS4_STATE_PATH
+        od.DS4_STATE_PATH = Path(self._state_tmp.name) / "ds4-state.json"
         self._saved_attrs = {k: getattr(od, k) for k in self.patches}
         for k, v in self.patches.items():
             setattr(od, k, v)
@@ -83,6 +87,8 @@ class Patched(unittest.TestCase):
         for k, v in self._saved_attrs.items():
             setattr(od, k, v)
         od.state.http_client = self._saved_client
+        od.DS4_STATE_PATH = self._saved_state_path
+        self._state_tmp.cleanup()
         reset_state()
 
 
@@ -404,6 +410,144 @@ class HoldTest(Patched):
 
         asyncio.run(scenario())
         self.assertEqual(self.spawned, [])
+
+
+class HoldPersistenceTest(Patched):
+    """Holds survive a launcher restart: id, reason and an absolute expiry live
+    in ds4-state.json, next to the persisted ctx."""
+
+    patches = {k: None for k in PIPELINE_ATTRS}
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.spawned: list[FakeProc] = []
+        install_pipeline(self.spawned)
+        self.client = TestClient(od.app, client=LOCAL)
+
+    def _hold(self, reason="studio training", ttl=120) -> str:
+        resp = self.client.post("/admin/hold", json={"reason": reason, "ttl_s": ttl})
+        self.assertEqual(resp.status_code, 200)
+        return resp.json()["hold_id"]
+
+    def _file(self) -> dict:
+        return json.loads(od.DS4_STATE_PATH.read_text())
+
+    def _restart(self) -> None:
+        """What a launcher restart does to the hold table."""
+        od.state.holds = {}
+        od.apply_persisted_holds()
+
+    def test_create_persists_id_reason_and_absolute_expiry(self) -> None:
+        before = od.time.time()
+        hold_id = self._hold("studio training", 120)
+        after = od.time.time()
+        [entry] = self._file()["holds"]
+        self.assertEqual(entry["id"], hold_id)
+        self.assertEqual(entry["reason"], "studio training")
+        self.assertTrue(before + 120 <= entry["expires_at"] <= after + 120)
+        self.assertFalse(od.DS4_STATE_PATH.with_name("ds4-state.json.tmp").exists())
+
+    def test_delete_removes_the_hold_from_the_file(self) -> None:
+        a = self._hold("a")
+        b = self._hold("b")
+        self.assertEqual(self.client.delete(f"/admin/hold/{a}").status_code, 200)
+        self.assertEqual([h["id"] for h in self._file()["holds"]], [b])
+        self.client.delete(f"/admin/hold/{b}")
+        self.assertEqual(self._file()["holds"], [])
+        self._restart()
+        self.assertEqual(od.state.holds, {})
+
+    def test_restart_keeps_the_barrier_and_the_id(self) -> None:
+        hold_id = self._hold("studio training", 120)
+        self._restart()
+        self.assertIn(hold_id, od.state.holds)
+        status = self.client.get("/admin/status").json()
+        self.assertEqual([h["id"] for h in status["holds"]], [hold_id])
+        self.assertTrue(100 < status["holds"][0]["ttl_remaining_s"] <= 120)
+
+        async def attempt() -> None:
+            with self.assertRaises(od.ServerHeldError) as ctx:
+                await od.ensure_started()
+            self.assertEqual(ctx.exception.reason, "studio training")
+
+        asyncio.run(attempt())
+        self.assertEqual(self.spawned, [])
+        # The old owner can still release it by id after the restart.
+        self.assertEqual(self.client.delete(f"/admin/hold/{hold_id}").status_code, 200)
+        self.assertEqual(self._file()["holds"], [])
+
+    def test_restart_does_not_extend_the_ttl(self) -> None:
+        od.DS4_STATE_PATH.write_text(
+            json.dumps(
+                {
+                    "holds": [
+                        {"id": "live", "reason": "r", "expires_at": od.time.time() + 30},
+                        {"id": "gone", "reason": "r", "expires_at": od.time.time() - 1},
+                    ]
+                }
+            )
+        )
+        od.apply_persisted_holds()
+        self.assertEqual(list(od.state.holds), ["live"])
+        remaining = od.state.holds["live"]["expires"] - od.time.monotonic()
+        self.assertTrue(25 < remaining <= 30)
+
+    def test_downtime_counts_against_the_ttl(self) -> None:
+        hold_id = self._hold(ttl=5)
+        # The launcher was down past the expiry: nothing is reloaded.
+        saved = self._file()
+        saved["holds"][0]["expires_at"] = od.time.time() - 0.5
+        od.DS4_STATE_PATH.write_text(json.dumps(saved))
+        self._restart()
+        self.assertNotIn(hold_id, od.state.holds)
+
+    def test_ctx_and_holds_share_the_file(self) -> None:
+        od.save_persisted_ctx(32768)
+        hold_id = self._hold()
+        data = self._file()
+        self.assertEqual(data["ctx"], 32768)
+        self.assertEqual([h["id"] for h in data["holds"]], [hold_id])
+        od.save_persisted_ctx(65536)
+        data = self._file()
+        self.assertEqual(data["ctx"], 65536)
+        self.assertEqual([h["id"] for h in data["holds"]], [hold_id])
+
+    def test_malformed_state_is_ignored(self) -> None:
+        for text in (
+            "not json",
+            json.dumps([1, 2]),
+            json.dumps({"holds": "x"}),
+            json.dumps({"holds": [None, 3, {"id": "a"}, {"id": 1, "reason": "r", "expires_at": 9e18}]}),
+            json.dumps(
+                {"holds": [{"id": "a", "reason": "r", "expires_at": True},
+                           {"id": "b", "reason": "r", "expires_at": "soon"}]}
+            ),
+        ):
+            with self.subTest(text=text):
+                od.DS4_STATE_PATH.write_text(text)
+                od.state.holds = {}
+                od.apply_persisted_holds()
+                self.assertEqual(od.state.holds, {})
+
+    def test_absurd_expiry_is_capped_at_the_max_ttl(self) -> None:
+        od.DS4_STATE_PATH.write_text(
+            json.dumps({"holds": [{"id": "far", "reason": "r", "expires_at": od.time.time() + 10**9}]})
+        )
+        od.apply_persisted_holds()
+        remaining = od.state.holds["far"]["expires"] - od.time.monotonic()
+        self.assertTrue(remaining <= od.HOLD_TTL_MAX)
+
+    def test_unwritable_state_does_not_fail_the_hold(self) -> None:
+        od.DS4_STATE_PATH = Path(self._state_tmp.name) / "blocker" / "ds4-state.json"
+        Path(self._state_tmp.name, "blocker").write_text("a file, not a directory")
+        hold_id = self._hold()
+        self.assertIn(hold_id, od.state.holds)
+
+    def test_reload_does_not_replace_a_live_hold(self) -> None:
+        hold_id = self._hold(ttl=120)
+        deadline = od.state.holds[hold_id]["expires"]
+        od.apply_persisted_holds()
+        self.assertEqual(od.state.holds[hold_id]["expires"], deadline)
 
 
 def omlx_transport(models_by_poll: list[list[dict]], posts: list[str]):
