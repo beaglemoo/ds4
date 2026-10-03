@@ -1,0 +1,848 @@
+#!/usr/bin/env -S uv run
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "fastapi",
+#     "uvicorn",
+#     "httpx",
+# ]
+# ///
+"""On-demand launcher/proxy for DwarfStar's ds4-server.
+
+Listens on DS4_ONDEMAND_HOST:DS4_ONDEMAND_PORT (default 0.0.0.0:8001) and
+proxies everything to a ds4-server child process on 127.0.0.1:8000, starting
+it lazily on first request and stopping it after DS4_IDLE_SECONDS of no
+in-flight requests. Because ds4-server (DS4 / Qwen3.8-Flash-Next Q2, ~43 GiB
+resident) and oMLX's 35B-A3B (~20 GiB) cannot both be resident on this 64 GB
+Mac, ds4-server startup first asks oMLX which models are loaded and unloads
+them, tolerating oMLX being stopped entirely.
+
+GET /v1/models answers instantly from a static alias list without starting
+ds4-server, so model pickers work while it is cold. Every other /v1/* path is
+proxied with full streaming passthrough (SSE included).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import subprocess
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import quote
+
+import httpx
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
+
+# --------------------------------------------------------------------------
+# Configuration (all overridable via environment)
+# --------------------------------------------------------------------------
+
+DS4_ONDEMAND_HOST = os.environ.get("DS4_ONDEMAND_HOST", "0.0.0.0")
+DS4_ONDEMAND_PORT = int(os.environ.get("DS4_ONDEMAND_PORT", "8001"))
+
+DS4_SERVER_HOST = "127.0.0.1"  # ds4-server itself always stays loopback-only
+DS4_SERVER_PORT = int(os.environ.get("DS4_SERVER_PORT", "8000"))
+
+DS4_REPO_DIR = Path(
+    os.environ.get("DS4_REPO_DIR", "/Users/beaglemoo/Homelab/dwarfstar")
+).resolve()
+# Optional overrides so a bundled install (Unsloth.app) can keep the binary,
+# its metal/ shader dir (the child's cwd) and the logs outside the repo.
+DS4_BINARY = Path(os.environ.get("DS4_BINARY") or (DS4_REPO_DIR / "ds4-server"))
+DS4_WORKDIR = Path(os.environ.get("DS4_WORKDIR") or DS4_REPO_DIR).resolve()
+DS4_MODEL_FILE = os.environ.get("DS4_MODEL_FILE", "ds4flash.gguf")
+DS4_VISION_FILE = os.environ.get(
+    "DS4_VISION_FILE", "gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf"
+)
+DS4_CTX = os.environ.get("DS4_CTX", "65536")
+DS4_PREFILL_CHUNK = os.environ.get("DS4_PREFILL_CHUNK", "1024")
+
+DS4_START_TIMEOUT = float(os.environ.get("DS4_START_TIMEOUT", "120"))
+DS4_IDLE_SECONDS = float(os.environ.get("DS4_IDLE_SECONDS", "300"))
+
+OMLX_BASE_URL = os.environ.get("OMLX_BASE_URL", "http://127.0.0.1:8843")
+
+DS4_SAMPLING_INJECT = os.environ.get("DS4_SAMPLING_INJECT", "1") != "0"
+DS4_SAMPLING_DEFAULTS = os.environ.get("DS4_SAMPLING_DEFAULTS")
+
+DS4_DEBUG = os.environ.get("DS4_DEBUG", "0") != "0"
+
+LOGS_DIR = Path(os.environ.get("DS4_LOG_DIR") or (DS4_REPO_DIR / "logs"))
+DS4_LOG_PATH = LOGS_DIR / "ds4-server.log"
+
+STATIC_MODELS = [
+    "qwen3.8-flash-next",
+    "qwen3.8-flash-next-chat",
+    "qwen3.8-flash-next-reasoner",
+]
+
+# Sampling parameters recommended by the Qwen3.8-Flash-Next model card ("Best
+# Practices": non-thinking mode temperature 0.7 / top_p 0.8 / top_k 20,
+# thinking mode temperature 1.0 / top_p 0.95 / top_k 20). ds4-server's own
+# defaults are temperature 1.0 / top_p 1.0 / top_k 0 / min_p 0.05, which is far
+# too flat for no-think answers, so the proxy fills these in when the client
+# did not ask for anything specific. The card's presence_penalty 0..2 range is
+# used the same way: 1.5 against repetition in no-think mode, 0 for thinking,
+# where a penalty interferes with long reasoning chains.
+SAMPLING_NOTHINK = {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "presence_penalty": 1.5,
+}
+SAMPLING_THINK = {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "presence_penalty": 0.0,
+}
+
+# Proxied paths that get throughput stats tracked, mapped to the short route
+# key used by StreamTracker to pick the right SSE/JSON parsing rules.
+STATS_ROUTES = {
+    "v1/chat/completions": "chat",
+    "v1/completions": "completions",
+    "v1/responses": "responses",
+    "v1/messages": "messages",
+}
+
+HOP_BY_HOP = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "content-length",
+}
+
+START_EPOCH = int(time.time())
+
+
+def log(msg: str) -> None:
+    ts = datetime.now().astimezone().isoformat(timespec="seconds")
+    print(f"{ts} [ds4-ondemand] {msg}", flush=True)
+
+
+def log_debug(msg: str) -> None:
+    """Verbose per-request logging, off unless DS4_DEBUG is set to non-zero."""
+    if DS4_DEBUG:
+        log(msg)
+
+
+def _tail_log(n: int = 200) -> str:
+    try:
+        text = DS4_LOG_PATH.read_text(errors="replace")
+    except FileNotFoundError:
+        return "(no ds4-server log file yet)"
+    lines = text.splitlines()
+    return "\n".join(lines[-n:])
+
+
+def _log_free_memory() -> None:
+    try:
+        out = subprocess.run(
+            ["vm_stat"], capture_output=True, text=True, timeout=5
+        ).stdout
+        page_size_match = re.search(r"page size of (\d+) bytes", out)
+        page_size = int(page_size_match.group(1)) if page_size_match else 16384
+
+        def pages(label: str) -> int:
+            m = re.search(rf"{label}:\s+(\d+)", out)
+            return int(m.group(1)) if m else 0
+
+        free_p = pages("Pages free")
+        inactive_p = pages("Pages inactive")
+        spec_p = pages("Pages speculative")
+        avail_gib = (free_p + inactive_p + spec_p) * page_size / (1024**3)
+        log(
+            f"approx reclaimable memory before ds4-server start: "
+            f"{avail_gib:.1f} GiB (vm_stat free+inactive+speculative)"
+        )
+    except Exception as e:
+        log(f"vm_stat check failed (non-fatal): {e}")
+
+
+# --------------------------------------------------------------------------
+# Sampling defaults
+# --------------------------------------------------------------------------
+
+
+def load_sampling_sets(raw: str | None) -> dict[str, dict]:
+    """Parse DS4_SAMPLING_DEFAULTS, a JSON object of shape
+    {"think": {...}, "nothink": {...}}. Anything unparseable or of the wrong
+    shape is logged and ignored in favour of the model-card constants."""
+    sets = {"think": dict(SAMPLING_THINK), "nothink": dict(SAMPLING_NOTHINK)}
+    if not raw:
+        return sets
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError("top level is not an object")
+        for key in ("think", "nothink"):
+            if key not in parsed:
+                continue
+            value = parsed[key]
+            if not isinstance(value, dict):
+                raise ValueError(f"{key} is not an object")
+            sets[key] = dict(value)
+    except Exception as e:
+        log(f"DS4_SAMPLING_DEFAULTS ignored, using built-in defaults: {e}")
+        return {"think": dict(SAMPLING_THINK), "nothink": dict(SAMPLING_NOTHINK)}
+    return sets
+
+
+SAMPLING_SETS = load_sampling_sets(DS4_SAMPLING_DEFAULTS)
+
+
+def sampling_defaults_for(model: str | None) -> dict:
+    """ds4-server picks no-think mode from the alias suffix (-chat), and
+    thinking for every other alias, so the sampling set follows the alias."""
+    if model is not None and model.strip().lower().endswith("-chat"):
+        return SAMPLING_SETS["nothink"]
+    return SAMPLING_SETS["think"]
+
+
+def apply_sampling_defaults(data: dict, route_key: str) -> list[str]:
+    """Fill sampling keys the client left out, in place. A key present in the
+    body is client intent and is never overridden, not even when it is null.
+    Returns the names of the keys that were injected."""
+    if not DS4_SAMPLING_INJECT or not isinstance(data, dict):
+        return []
+    if route_key not in STATS_ROUTES.values():
+        return []
+    injected = []
+    # All four tracked routes (OpenAI chat/completions, Responses, Anthropic
+    # messages) parse temperature, top_p, top_k and presence_penalty in
+    # ds4_server.c.
+    for key, value in sampling_defaults_for(data.get("model")).items():
+        if key not in data:
+            data[key] = value
+            injected.append(key)
+    return injected
+
+
+# --------------------------------------------------------------------------
+# Request throughput stats
+# --------------------------------------------------------------------------
+
+
+class StreamTracker:
+    """Tracks token throughput for a single proxied request, from the moment
+    it is dispatched to ds4-server until it finishes. Handles both SSE
+    (streaming) and plain JSON (non-streaming) responses for the four
+    tracked routes: chat, completions, responses, messages."""
+
+    def __init__(self, route: str, model: str | None) -> None:
+        self.route = route
+        self.model = model
+        self.start = time.monotonic()
+        self.first_delta_time: float | None = None
+        self.gen_tokens = 0
+        self.prompt_tokens: int | None = None
+        self.completion_tokens: int | None = None
+        self._sse_buffer = b""
+        self._pending_event: str | None = None
+
+    def note_content_delta(self) -> None:
+        now = time.monotonic()
+        if self.first_delta_time is None:
+            self.first_delta_time = now
+        self.gen_tokens += 1
+
+    def note_usage(self, prompt_tokens: int | None, completion_tokens: int | None) -> None:
+        if prompt_tokens is not None:
+            self.prompt_tokens = prompt_tokens
+        if completion_tokens is not None:
+            self.completion_tokens = completion_tokens
+
+    def feed_sse(self, chunk: bytes) -> None:
+        """Parse SSE lines out of a raw byte chunk, purely for stats. Never
+        alters or delays the chunk itself -- callers pass the same bytes
+        through to the client regardless of what happens here."""
+        self._sse_buffer += chunk
+        while b"\n" in self._sse_buffer:
+            line, self._sse_buffer = self._sse_buffer.split(b"\n", 1)
+            text = line.decode("utf-8", errors="replace").strip("\r")
+            if not text:
+                continue
+            if text.startswith("event:"):
+                self._pending_event = text[len("event:"):].strip()
+                continue
+            if not text.startswith("data:"):
+                continue
+            payload = text[len("data:"):].strip()
+            event = self._pending_event
+            self._pending_event = None
+            if payload == "[DONE]":
+                continue
+            self._handle_event(event, json.loads(payload))
+
+    def _handle_event(self, event: str | None, obj: dict) -> None:
+        if self.route in ("chat", "completions"):
+            choices = obj.get("choices") or []
+            if choices:
+                choice = choices[0]
+                if self.route == "chat":
+                    delta = choice.get("delta") or {}
+                    text = delta.get("content") or delta.get("reasoning_content")
+                else:
+                    text = choice.get("text")
+                if text:
+                    self.note_content_delta()
+            usage = obj.get("usage")
+            if usage:
+                self.note_usage(usage.get("prompt_tokens"), usage.get("completion_tokens"))
+        elif self.route == "responses":
+            if event == "response.output_text.delta" and obj.get("delta"):
+                self.note_content_delta()
+            elif event == "response.completed":
+                usage = (obj.get("response") or {}).get("usage") or {}
+                if usage:
+                    self.note_usage(usage.get("input_tokens"), usage.get("output_tokens"))
+        elif self.route == "messages":
+            if event == "content_block_delta":
+                delta = obj.get("delta") or {}
+                if delta.get("type") == "text_delta" and delta.get("text"):
+                    self.note_content_delta()
+            elif event == "message_start":
+                usage = (obj.get("message") or {}).get("usage") or {}
+                if usage.get("input_tokens") is not None:
+                    self.prompt_tokens = usage.get("input_tokens")
+            elif event == "message_delta":
+                usage = obj.get("usage") or {}
+                if usage.get("output_tokens") is not None:
+                    self.note_usage(None, usage.get("output_tokens"))
+
+    def parse_full_body(self, raw: bytes) -> None:
+        """For non-streaming responses: pull usage out of the complete JSON
+        body once it has all arrived."""
+        obj = json.loads(raw)
+        if self.route in ("chat", "completions"):
+            usage = obj.get("usage") or {}
+            self.note_usage(usage.get("prompt_tokens"), usage.get("completion_tokens"))
+        else:  # responses, messages
+            usage = obj.get("usage") or {}
+            self.note_usage(usage.get("input_tokens"), usage.get("output_tokens"))
+
+    def live_snapshot(self) -> dict:
+        now = time.monotonic()
+        if self.first_delta_time is None:
+            return {
+                "gen_tokens": self.gen_tokens,
+                "gen_tps": 0.0,
+                "elapsed_s": now - self.start,
+                "phase": "prefill",
+            }
+        decode_elapsed = now - self.first_delta_time
+        gen_tps = self.gen_tokens / decode_elapsed if decode_elapsed > 0 else 0.0
+        return {
+            "gen_tokens": self.gen_tokens,
+            "gen_tps": gen_tps,
+            "elapsed_s": now - self.start,
+            "phase": "decode",
+        }
+
+    def finalize(self) -> dict:
+        end = time.monotonic()
+        duration = end - self.start
+        completion_tokens = (
+            self.completion_tokens if self.completion_tokens is not None else self.gen_tokens
+        )
+        if self.first_delta_time is not None:
+            ttft_ms = (self.first_delta_time - self.start) * 1000
+            decode_elapsed = end - self.first_delta_time
+            gen_tps = completion_tokens / decode_elapsed if decode_elapsed > 0 else 0.0
+        else:
+            ttft_ms = duration * 1000
+            gen_tps = completion_tokens / duration if duration > 0 else 0.0
+        prefill_tps = None
+        if self.prompt_tokens is not None and ttft_ms > 0:
+            prefill_tps = self.prompt_tokens / (ttft_ms / 1000)
+        return {
+            "model": self.model,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "ttft_ms": ttft_ms,
+            "prefill_tps": prefill_tps,
+            "gen_tps": gen_tps,
+            "duration_s": duration,
+            "finished_at": time.time(),
+        }
+
+
+class Stats:
+    """In-memory request throughput stats for /admin/status. Reset whenever
+    the launcher restarts."""
+
+    def __init__(self) -> None:
+        self.requests = 0
+        self.completion_tokens = 0
+        self.errors = 0
+        self.last: dict | None = None
+        self._active: list[StreamTracker] = []
+
+    def start_tracker(self, route: str, model: str | None) -> StreamTracker:
+        tracker = StreamTracker(route, model)
+        self._active.append(tracker)
+        return tracker
+
+    def finish_tracker(self, tracker: StreamTracker, *, error: bool = False) -> None:
+        if tracker in self._active:
+            self._active.remove(tracker)
+        self.requests += 1
+        if error:
+            self.errors += 1
+            return
+        result = tracker.finalize()
+        self.completion_tokens += result["completion_tokens"]
+        self.last = result
+
+    def snapshot(self) -> dict:
+        live = self._active[-1].live_snapshot() if self._active else None
+        return {
+            "live": live,
+            "last": self.last,
+            "totals": {
+                "requests": self.requests,
+                "completion_tokens": self.completion_tokens,
+                "errors": self.errors,
+            },
+        }
+
+
+# --------------------------------------------------------------------------
+# State
+# --------------------------------------------------------------------------
+
+
+class ServerStartError(Exception):
+    pass
+
+
+class State:
+    def __init__(self) -> None:
+        self.process: asyncio.subprocess.Process | None = None
+        self.ready = False
+        self.lock = asyncio.Lock()
+        self.in_flight = 0
+        self.last_activity = time.monotonic()
+        self.start_time: float | None = None
+        self.http_client: httpx.AsyncClient | None = None
+        self.idle_task: asyncio.Task | None = None
+        self.stats = Stats()
+
+
+state = State()
+
+# --------------------------------------------------------------------------
+# oMLX interplay
+# --------------------------------------------------------------------------
+
+
+async def _get_omlx_loaded_ids() -> list[str]:
+    url = f"{OMLX_BASE_URL}/v1/models/status"
+    try:
+        r = await state.http_client.get(url, timeout=5.0)
+        r.raise_for_status()
+        data = r.json()
+        return [m["id"] for m in data.get("models", []) if m.get("loaded")]
+    except Exception as e:
+        log(f"omlx status check failed (tolerated, omlx may be stopped): {e}")
+        return []
+
+
+async def _unload_omlx_models() -> None:
+    ids = await _get_omlx_loaded_ids()
+    if not ids:
+        log("omlx: nothing loaded to unload (or omlx unreachable)")
+        return
+    for mid in ids:
+        url = f"{OMLX_BASE_URL}/v1/models/{quote(mid, safe='')}/unload"
+        try:
+            r = await state.http_client.post(url, timeout=30.0)
+            log(f"omlx unload {mid}: HTTP {r.status_code}")
+        except Exception as e:
+            log(f"omlx unload {mid} failed (tolerated): {e}")
+
+
+# --------------------------------------------------------------------------
+# ds4-server process management
+# --------------------------------------------------------------------------
+
+
+async def _spawn() -> asyncio.subprocess.Process:
+    if not DS4_BINARY.exists():
+        raise ServerStartError(f"ds4-server binary not found: {DS4_BINARY}")
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    logf = open(DS4_LOG_PATH, "a", buffering=1)
+    args = [
+        str(DS4_BINARY),
+        "-m",
+        DS4_MODEL_FILE,
+        "--ctx",
+        str(DS4_CTX),
+        "--prefill-chunk",
+        str(DS4_PREFILL_CHUNK),
+        "--mtp",
+        "--host",
+        DS4_SERVER_HOST,
+        "--port",
+        str(DS4_SERVER_PORT),
+    ]
+    # Relative paths resolve against the child's cwd (DS4_WORKDIR); absolute
+    # DS4_MODEL_FILE / DS4_VISION_FILE values are used as given.
+    if DS4_VISION_FILE and (DS4_WORKDIR / DS4_VISION_FILE).exists():
+        args += ["--vision", DS4_VISION_FILE]
+    else:
+        log(f"vision encoder not found, starting without --vision: {DS4_VISION_FILE}")
+    log(f"spawning: {' '.join(args)} (cwd={DS4_WORKDIR})")
+    try:
+        logf.write(
+            f"\n===== ds4-ondemand spawn {datetime.now().isoformat()} =====\n"
+        )
+        proc = await asyncio.create_subprocess_exec(
+            *args, cwd=str(DS4_WORKDIR), stdout=logf, stderr=logf
+        )
+    finally:
+        logf.close()
+    return proc
+
+
+async def _terminate_process(proc: asyncio.subprocess.Process | None) -> None:
+    if proc is None or proc.returncode is not None:
+        return
+    log(f"sending SIGTERM to ds4-server pid={proc.pid}")
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=10)
+    except asyncio.TimeoutError:
+        log(f"ds4-server pid={proc.pid} still alive after 10s, sending SIGKILL")
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+    log(f"ds4-server pid={proc.pid} exited with code {proc.returncode}")
+
+
+async def _wait_ready(timeout: float) -> tuple[bool, str | None]:
+    url = f"http://{DS4_SERVER_HOST}:{DS4_SERVER_PORT}/v1/models"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if state.process is not None and state.process.returncode is not None:
+            return False, f"process exited early with code {state.process.returncode}"
+        try:
+            r = await state.http_client.get(url, timeout=2.0)
+            if r.status_code == 200:
+                return True, None
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+    return False, f"timed out after {timeout}s"
+
+
+async def _stop_locked() -> None:
+    if state.process is not None:
+        await _terminate_process(state.process)
+    state.process = None
+    state.ready = False
+    state.start_time = None
+
+
+async def stop_ds4_server() -> None:
+    async with state.lock:
+        await _stop_locked()
+
+
+async def ensure_started() -> None:
+    """Start ds4-server if it is not already up and ready. Single-start
+    guarded by state.lock, so concurrent cold requests trigger exactly one
+    spawn."""
+    async with state.lock:
+        if state.ready and state.process is not None and state.process.returncode is None:
+            return
+
+        if state.process is not None and state.process.returncode is not None:
+            log(
+                f"previous ds4-server (pid={state.process.pid}) exited "
+                f"(code {state.process.returncode}); resetting state"
+            )
+            state.process = None
+            state.ready = False
+
+        log("cold start requested: unloading oMLX models before starting ds4-server")
+        await _unload_omlx_models()
+        _log_free_memory()
+
+        proc = await _spawn()
+        state.process = proc
+        state.start_time = time.monotonic()
+
+        ok, err = await _wait_ready(DS4_START_TIMEOUT)
+        if not ok:
+            log(f"ds4-server did not become ready: {err}")
+            await _terminate_process(proc)
+            state.process = None
+            state.ready = False
+            state.start_time = None
+            tail = _tail_log()
+            raise ServerStartError(
+                f"ds4-server failed to become ready ({err}). Log tail:\n{tail}"
+            )
+
+        state.ready = True
+        log(
+            f"ds4-server ready after {time.monotonic() - state.start_time:.1f}s, "
+            f"pid={proc.pid}"
+        )
+
+
+async def idle_watcher() -> None:
+    while True:
+        await asyncio.sleep(5)
+        try:
+            async with state.lock:
+                if state.ready and state.in_flight == 0:
+                    idle_for = time.monotonic() - state.last_activity
+                    if idle_for >= DS4_IDLE_SECONDS:
+                        log(
+                            f"idle for {idle_for:.0f}s (limit {DS4_IDLE_SECONDS:.0f}s) "
+                            f"with 0 in-flight requests; stopping ds4-server"
+                        )
+                        await _stop_locked()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log(f"idle watcher error (non-fatal): {e}")
+
+
+# --------------------------------------------------------------------------
+# FastAPI app
+# --------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    state.http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=5.0, read=None, write=30.0, pool=5.0)
+    )
+    state.idle_task = asyncio.create_task(idle_watcher())
+    log(
+        f"ds4-ondemand listening on {DS4_ONDEMAND_HOST}:{DS4_ONDEMAND_PORT}, "
+        f"proxying to {DS4_SERVER_HOST}:{DS4_SERVER_PORT}, "
+        f"idle_seconds={DS4_IDLE_SECONDS}, start_timeout={DS4_START_TIMEOUT}, "
+        f"omlx={OMLX_BASE_URL}"
+    )
+    try:
+        yield
+    finally:
+        log("shutting down: stopping ds4-server if running")
+        if state.idle_task is not None:
+            state.idle_task.cancel()
+        await stop_ds4_server()
+        if state.http_client is not None:
+            await state.http_client.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/v1/models")
+async def list_models():
+    """Answers from a static alias list WITHOUT starting ds4-server, so
+    model pickers work while it is cold."""
+    loaded = state.ready
+    data = [
+        {
+            "id": model_id,
+            "object": "model",
+            "created": START_EPOCH,
+            "owned_by": "dwarfstar",
+            "loaded": loaded,
+        }
+        for model_id in STATIC_MODELS
+    ]
+    return {"object": "list", "data": data}
+
+
+@app.get("/admin/status")
+async def admin_status():
+    now = time.monotonic()
+    idle_for = now - state.last_activity
+    remaining = None
+    if state.ready and state.in_flight == 0:
+        remaining = max(0.0, DS4_IDLE_SECONDS - idle_for)
+    return {
+        "loaded": state.ready,
+        "pid": state.process.pid if state.process is not None else None,
+        "uptime_seconds": (
+            (now - state.start_time) if (state.ready and state.start_time) else None
+        ),
+        "last_activity_seconds_ago": idle_for,
+        "in_flight": state.in_flight,
+        "idle_seconds_remaining": remaining,
+        "stats": state.stats.snapshot(),
+        "config": {
+            "ds4_ondemand_host": DS4_ONDEMAND_HOST,
+            "ds4_ondemand_port": DS4_ONDEMAND_PORT,
+            "ds4_server_host": DS4_SERVER_HOST,
+            "ds4_server_port": DS4_SERVER_PORT,
+            "ds4_repo_dir": str(DS4_REPO_DIR),
+            "ds4_workdir": str(DS4_WORKDIR),
+            "ds4_binary": str(DS4_BINARY),
+            "ds4_model_file": DS4_MODEL_FILE,
+            "ds4_vision_file": DS4_VISION_FILE,
+            "ds4_ctx": DS4_CTX,
+            "ds4_prefill_chunk": DS4_PREFILL_CHUNK,
+            "ds4_start_timeout": DS4_START_TIMEOUT,
+            "ds4_idle_seconds": DS4_IDLE_SECONDS,
+            "omlx_base_url": OMLX_BASE_URL,
+            "sampling_inject": DS4_SAMPLING_INJECT,
+            "sampling_defaults": SAMPLING_SETS,
+        },
+    }
+
+
+@app.post("/admin/stop")
+async def admin_stop():
+    await stop_ds4_server()
+    return {"status": "ok", "loaded": state.ready}
+
+
+@app.post("/admin/start")
+async def admin_start():
+    try:
+        await ensure_started()
+    except ServerStartError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return {
+        "status": "ok",
+        "loaded": state.ready,
+        "pid": state.process.pid if state.process is not None else None,
+    }
+
+
+def _filtered_headers(headers) -> list[tuple[str, str]]:
+    return [(k, v) for k, v in headers.items() if k.lower() not in HOP_BY_HOP]
+
+
+@app.api_route(
+    "/{full_path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+async def proxy(full_path: str, request: Request):
+    if not full_path.startswith("v1/"):
+        raise HTTPException(status_code=404, detail="not found")
+
+    state.in_flight += 1
+    state.last_activity = time.monotonic()
+    started_stream = False
+    route_key = STATS_ROUTES.get(full_path)
+    trackable = route_key is not None and request.method == "POST"
+    tracker: StreamTracker | None = None
+    try:
+        try:
+            await ensure_started()
+        except ServerStartError as e:
+            raise HTTPException(status_code=503, detail=str(e))
+
+        body = await request.body()
+
+        if trackable:
+            model_hint = None
+            try:
+                data = json.loads(body)
+                model_hint = data.get("model")
+                rewritten = False
+                injected = apply_sampling_defaults(data, route_key)
+                if injected:
+                    rewritten = True
+                    shown = " ".join(f"{k}={data[k]}" for k in injected)
+                    log_debug(
+                        f"sampling defaults injected for {model_hint}: {shown}"
+                    )
+                if (
+                    route_key in ("chat", "completions")
+                    and data.get("stream") is True
+                    and "stream_options" not in data
+                ):
+                    data["stream_options"] = {"include_usage": True}
+                    rewritten = True
+                if rewritten:
+                    body = json.dumps(data).encode()
+            except Exception as e:
+                log(f"stats: failed to parse request body for {full_path} (non-fatal): {e}")
+            tracker = state.stats.start_tracker(route_key, model_hint)
+
+        target = f"http://{DS4_SERVER_HOST}:{DS4_SERVER_PORT}/{full_path}"
+        if request.url.query:
+            target += "?" + request.url.query
+
+        req_headers = _filtered_headers(request.headers)
+        upstream_req = state.http_client.build_request(
+            request.method, target, headers=req_headers, content=body
+        )
+        upstream = await state.http_client.send(upstream_req, stream=True)
+        started_stream = True
+    except Exception:
+        if tracker is not None:
+            state.stats.finish_tracker(tracker, error=True)
+        raise
+    finally:
+        if not started_stream:
+            state.in_flight -= 1
+            state.last_activity = time.monotonic()
+
+    resp_headers = _filtered_headers(upstream.headers)
+    is_sse = upstream.headers.get("content-type", "").startswith("text/event-stream")
+    upstream_is_error = upstream.status_code >= 400
+    non_stream_buffer = bytearray() if (tracker is not None and not is_sse) else None
+
+    async def body_iter():
+        try:
+            async for chunk in upstream.aiter_bytes():
+                if tracker is not None:
+                    try:
+                        if is_sse:
+                            tracker.feed_sse(chunk)
+                        elif non_stream_buffer is not None:
+                            non_stream_buffer.extend(chunk)
+                    except Exception as e:
+                        log(f"stats: parse failed for {full_path} (non-fatal): {e}")
+                yield chunk
+        finally:
+            await upstream.aclose()
+            state.in_flight -= 1
+            state.last_activity = time.monotonic()
+            if tracker is not None:
+                error = upstream_is_error
+                if not error and non_stream_buffer is not None:
+                    try:
+                        tracker.parse_full_body(bytes(non_stream_buffer))
+                    except Exception as e:
+                        log(f"stats: full-body parse failed for {full_path} (non-fatal): {e}")
+                state.stats.finish_tracker(tracker, error=error)
+
+    return StreamingResponse(
+        body_iter(),
+        status_code=upstream.status_code,
+        headers=dict(resp_headers),
+    )
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host=DS4_ONDEMAND_HOST, port=DS4_ONDEMAND_PORT, log_level="info")
