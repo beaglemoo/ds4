@@ -82,6 +82,7 @@ class FakeProc:
         self.pid = 4242
         self.returncode: int | None = None
         self.terminated = False
+        self.stdout = None
 
     def terminate(self) -> None:
         self.terminated = True
@@ -338,7 +339,7 @@ class CtxConfigTest(unittest.TestCase):
             raise AssertionError("ds4-server must not be spawned by /admin/config")
 
         od._spawn = no_spawn
-        self.client = TestClient(od.app)
+        self.client = TestClient(od.app, client=("127.0.0.1", 50000))
 
     def tearDown(self) -> None:
         od.DS4_STATE_PATH, od._spawn = self._saved

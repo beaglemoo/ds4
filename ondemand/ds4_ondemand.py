@@ -25,9 +25,14 @@ proxied with full streaming passthrough (SSE included).
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
+import logging
+import logging.handlers
+import math
 import os
 import re
+import secrets
 import subprocess
 import time
 from contextlib import asynccontextmanager
@@ -38,7 +43,7 @@ from urllib.parse import quote
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 # --------------------------------------------------------------------------
 # Configuration (all overridable via environment)
@@ -75,6 +80,30 @@ DS4_START_TIMEOUT = float(os.environ.get("DS4_START_TIMEOUT", "120"))
 DS4_IDLE_SECONDS = float(os.environ.get("DS4_IDLE_SECONDS", "300"))
 
 OMLX_BASE_URL = os.environ.get("OMLX_BASE_URL", "http://127.0.0.1:8843")
+# After asking oMLX to unload, wait this long for it to report nothing loaded
+# or loading; otherwise the cold start is refused (503) instead of spawning.
+OMLX_UNLOAD_WAIT = float(os.environ.get("DS4_OMLX_UNLOAD_WAIT", "10"))
+
+# ComfyUI is asked to free its models before a cold start (only when its queue
+# is empty). An empty value disables it.
+DS4_COMFYUI_URL = os.environ.get("DS4_COMFYUI_URL", "http://127.0.0.1:8188").strip()
+COMFYUI_TIMEOUT = 3.0
+
+# Graceful shutdown: uvicorn waits this long for open connections, and the
+# lifespan stop waits this long for state.lock before terminating the child
+# without it (a cold start can hold the lock for DS4_START_TIMEOUT).
+GRACEFUL_SHUTDOWN_SECONDS = 90
+SHUTDOWN_LOCK_TIMEOUT = float(os.environ.get("DS4_SHUTDOWN_LOCK_TIMEOUT", "10"))
+
+# Holds (POST /admin/hold) block cold starts until released or expired.
+HOLD_TTL_MIN = 1
+HOLD_TTL_MAX = 24 * 3600
+HOLD_RETRY_AFTER_MAX = 15
+START_RETRY_AFTER = 15
+
+# ds4-server.log rotation.
+DS4_LOG_MAX_BYTES = 10 * 1024 * 1024
+DS4_LOG_BACKUPS = 3
 
 DS4_SAMPLING_INJECT = os.environ.get("DS4_SAMPLING_INJECT", "1") != "0"
 DS4_SAMPLING_DEFAULTS = os.environ.get("DS4_SAMPLING_DEFAULTS")
@@ -617,7 +646,31 @@ class Stats:
 
 
 class ServerStartError(Exception):
-    pass
+    def __init__(self, message: str, retry_after: int | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class ServerHeldError(Exception):
+    """A cold start was refused because an unexpired hold exists."""
+
+    def __init__(self, reason: str, retry_after: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.retry_after = retry_after
+
+
+def _start_http_error(e: ServerStartError) -> HTTPException:
+    headers = {"Retry-After": str(e.retry_after)} if e.retry_after else None
+    return HTTPException(status_code=503, detail=str(e), headers=headers)
+
+
+def _held_response(e: ServerHeldError) -> JSONResponse:
+    return JSONResponse(
+        {"error": "held", "reason": e.reason},
+        status_code=503,
+        headers={"Retry-After": str(e.retry_after)},
+    )
 
 
 def parse_env_ctx(raw) -> int:
@@ -689,29 +742,90 @@ class State:
         self.ctx_active: int | None = None
         self.pending_restart = False
         self.pending_task: asyncio.Task | None = None
+        # Cold starts that have begun (counted before their first await) and
+        # not yet finished; `starting` is true while any exist.
+        self.starting_count = 0
+        # hold_id -> {"reason": str, "expires": monotonic deadline}
+        self.holds: dict[str, dict] = {}
+        # Set by the SIGTERM/SIGINT handler: streams end, no new cold starts.
+        self.stopping = False
+        self.log_task: asyncio.Task | None = None
+
+    @property
+    def starting(self) -> bool:
+        return self.starting_count > 0
 
 
 state = State()
+
+
+# --------------------------------------------------------------------------
+# Holds
+# --------------------------------------------------------------------------
+
+
+def _purge_holds() -> None:
+    now = time.monotonic()
+    for hold_id in [h for h, v in state.holds.items() if v["expires"] <= now]:
+        del state.holds[hold_id]
+
+
+def _active_holds() -> list[dict]:
+    _purge_holds()
+    now = time.monotonic()
+    return [
+        {
+            "id": hold_id,
+            "reason": v["reason"],
+            "ttl_remaining_s": max(0.0, v["expires"] - now),
+        }
+        for hold_id, v in state.holds.items()
+    ]
+
+
+def _raise_if_held() -> None:
+    holds = _active_holds()
+    if not holds:
+        return
+    first = min(holds, key=lambda h: h["ttl_remaining_s"])
+    retry = max(1, min(HOLD_RETRY_AFTER_MAX, math.ceil(first["ttl_remaining_s"])))
+    raise ServerHeldError(first["reason"], retry)
+
+
+def _raise_if_stopping() -> None:
+    if state.stopping:
+        raise ServerStartError(
+            "launcher is shutting down", retry_after=START_RETRY_AFTER
+        )
 
 # --------------------------------------------------------------------------
 # oMLX interplay
 # --------------------------------------------------------------------------
 
 
-async def _get_omlx_loaded_ids() -> list[str]:
+async def _omlx_resident_ids() -> list[str] | None:
+    """Ids oMLX has loaded or is loading; None when oMLX is unreachable."""
     url = f"{OMLX_BASE_URL}/v1/models/status"
     try:
         r = await state.http_client.get(url, timeout=5.0)
         r.raise_for_status()
         data = r.json()
-        return [m["id"] for m in data.get("models", []) if m.get("loaded")]
+        return [
+            m["id"]
+            for m in data.get("models", [])
+            if m.get("loaded") or m.get("is_loading")
+        ]
     except Exception as e:
         log(f"omlx status check failed (tolerated, omlx may be stopped): {e}")
-        return []
+        return None
 
 
 async def _unload_omlx_models() -> None:
-    ids = await _get_omlx_loaded_ids()
+    """Unload every oMLX model, then re-poll until nothing is loaded or
+    loading. Raises ServerStartError (503) if it is not clear after
+    OMLX_UNLOAD_WAIT seconds, so ds4-server is never spawned next to a
+    resident oMLX model. An unreachable oMLX counts as clear."""
+    ids = await _omlx_resident_ids()
     if not ids:
         log("omlx: nothing loaded to unload (or omlx unreachable)")
         return
@@ -722,6 +836,52 @@ async def _unload_omlx_models() -> None:
             log(f"omlx unload {mid}: HTTP {r.status_code}")
         except Exception as e:
             log(f"omlx unload {mid} failed (tolerated): {e}")
+    deadline = time.monotonic() + OMLX_UNLOAD_WAIT
+    while True:
+        remaining = await _omlx_resident_ids()
+        if not remaining:
+            return
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+    log(
+        f"omlx still has {remaining} loaded or loading after "
+        f"{OMLX_UNLOAD_WAIT:.0f}s; refusing cold start"
+    )
+    raise ServerStartError(
+        f"oMLX still has models loaded or loading after {OMLX_UNLOAD_WAIT:.0f}s "
+        f"({', '.join(remaining)}); refusing to start ds4-server",
+        retry_after=START_RETRY_AFTER,
+    )
+
+
+async def _free_comfyui() -> None:
+    """Ask ComfyUI to drop its models before ds4-server loads. Only when its
+    queue is empty; never raises, never delays a start by more than a few
+    seconds."""
+    if not DS4_COMFYUI_URL:
+        return
+    base = DS4_COMFYUI_URL.rstrip("/")
+    try:
+        r = await state.http_client.get(f"{base}/queue", timeout=COMFYUI_TIMEOUT)
+        r.raise_for_status()
+        queue = r.json()
+        running = queue.get("queue_running")
+        pending = queue.get("queue_pending")
+        if running or pending:
+            log(
+                f"comfyui busy ({len(running or [])} running, "
+                f"{len(pending or [])} pending); leaving its models loaded"
+            )
+            return
+        r = await state.http_client.post(
+            f"{base}/free",
+            json={"unload_models": True, "free_memory": True},
+            timeout=COMFYUI_TIMEOUT,
+        )
+        log(f"comfyui free before ds4 start: HTTP {r.status_code}")
+    except Exception as e:
+        log(f"comfyui free skipped (non-fatal): {e}")
 
 
 # --------------------------------------------------------------------------
@@ -729,11 +889,54 @@ async def _unload_omlx_models() -> None:
 # --------------------------------------------------------------------------
 
 
+_ds4_logger = logging.getLogger("ds4-ondemand.ds4-server-output")
+_ds4_logger.propagate = False
+_ds4_logger.setLevel(logging.INFO)
+_ds4_handler: logging.handlers.RotatingFileHandler | None = None
+
+
+def _ds4_output_logger() -> logging.Logger:
+    """Logger that owns ds4-server.log: 10 MB x 3 files, message only. The
+    handler is rebuilt if DS4_LOG_PATH changed (tests)."""
+    global _ds4_handler
+    path = str(DS4_LOG_PATH)
+    if _ds4_handler is None or _ds4_handler.baseFilename != os.path.abspath(path):
+        if _ds4_handler is not None:
+            _ds4_logger.removeHandler(_ds4_handler)
+            _ds4_handler.close()
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        _ds4_handler = logging.handlers.RotatingFileHandler(
+            path,
+            maxBytes=DS4_LOG_MAX_BYTES,
+            backupCount=DS4_LOG_BACKUPS,
+            encoding="utf-8",
+            errors="replace",
+        )
+        _ds4_handler.setFormatter(logging.Formatter("%(message)s"))
+        _ds4_logger.addHandler(_ds4_handler)
+    return _ds4_logger
+
+
+async def _pump_output(stream) -> None:
+    """Copy the child's stdout/stderr into the rotating ds4-server.log until
+    EOF. Never raises."""
+    out = _ds4_output_logger()
+    try:
+        while True:
+            line = await stream.readline()
+            if not line:
+                return
+            out.info(line.decode("utf-8", errors="replace").rstrip("\r\n"))
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log(f"ds4-server output pump stopped (non-fatal): {e}")
+
+
 async def _spawn() -> asyncio.subprocess.Process:
     if not DS4_BINARY.exists():
         raise ServerStartError(f"ds4-server binary not found: {DS4_BINARY}")
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    logf = open(DS4_LOG_PATH, "a", buffering=1)
     ctx = state.ctx
     args = [
         str(DS4_BINARY),
@@ -756,15 +959,17 @@ async def _spawn() -> asyncio.subprocess.Process:
     else:
         log(f"vision encoder not found, starting without --vision: {DS4_VISION_FILE}")
     log(f"spawning: {' '.join(args)} (cwd={DS4_WORKDIR})")
-    try:
-        logf.write(
-            f"\n===== ds4-ondemand spawn {datetime.now().isoformat()} =====\n"
-        )
-        proc = await asyncio.create_subprocess_exec(
-            *args, cwd=str(DS4_WORKDIR), stdout=logf, stderr=logf
-        )
-    finally:
-        logf.close()
+    _ds4_output_logger().info(
+        f"\n===== ds4-ondemand spawn {datetime.now().isoformat()} ====="
+    )
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        cwd=str(DS4_WORKDIR),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    if proc.stdout is not None:
+        state.log_task = asyncio.create_task(_pump_output(proc.stdout))
     state.ctx_active = ctx
     return proc
 
@@ -793,6 +998,8 @@ async def _wait_ready(timeout: float) -> tuple[bool, str | None]:
     url = f"http://{DS4_SERVER_HOST}:{DS4_SERVER_PORT}/v1/models"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if state.stopping:
+            return False, "launcher is shutting down"
         if state.process is not None and state.process.returncode is not None:
             return False, f"process exited early with code {state.process.returncode}"
         try:
@@ -816,62 +1023,112 @@ async def _stop_locked() -> None:
     state.pending_restart = False
 
 
-async def stop_ds4_server() -> None:
+class BusyError(Exception):
+    """stop?if_idle=1 refused: a request or a cold start is active."""
+
+
+async def stop_ds4_server(if_idle: bool = False) -> None:
+    """Stop ds4-server. With if_idle, raises BusyError instead when a request
+    is in flight or a cold start is in progress (checked again under the lock,
+    since a start that began meanwhile holds it)."""
+    if if_idle and (state.in_flight > 0 or state.starting):
+        raise BusyError
     async with state.lock:
+        if if_idle and (state.in_flight > 0 or state.starting):
+            raise BusyError
         await _stop_locked()
+
+
+async def shutdown_stop_ds4() -> None:
+    """Lifespan stop. A cold start can hold state.lock for minutes, so wait a
+    bounded time for it and then terminate the child without the lock."""
+    state.stopping = True
+    try:
+        await asyncio.wait_for(state.lock.acquire(), timeout=SHUTDOWN_LOCK_TIMEOUT)
+    except asyncio.TimeoutError:
+        log(
+            f"state.lock still held after {SHUTDOWN_LOCK_TIMEOUT:.0f}s; "
+            f"terminating ds4-server without it"
+        )
+        await _terminate_process(state.process)
+        return
+    try:
+        await _stop_locked()
+    finally:
+        state.lock.release()
+
+
+def _is_up() -> bool:
+    return state.ready and state.process is not None and state.process.returncode is None
 
 
 async def ensure_started() -> None:
     """Start ds4-server if it is not already up and ready. Single-start
     guarded by state.lock, so concurrent cold requests trigger exactly one
-    spawn."""
-    async with state.lock:
-        if state.ready and state.process is not None and state.process.returncode is None:
-            return
+    spawn. `starting` is raised before the first await (the lock wait), so
+    /admin/status reports it for the whole oMLX unload."""
+    if _is_up():
+        return
+    _raise_if_stopping()
+    _raise_if_held()
+    state.starting_count += 1
+    try:
+        async with state.lock:
+            if _is_up():
+                return
+            # A hold placed, or a shutdown begun, while we waited for the lock.
+            _raise_if_stopping()
+            _raise_if_held()
 
-        if state.process is not None and state.process.returncode is not None:
+            if state.process is not None and state.process.returncode is not None:
+                log(
+                    f"previous ds4-server (pid={state.process.pid}) exited "
+                    f"(code {state.process.returncode}); resetting state"
+                )
+                state.process = None
+                state.ready = False
+                state.ctx_active = None
+
+            log("cold start requested: unloading oMLX models before starting ds4-server")
+            await _unload_omlx_models()
+            await _free_comfyui()
+            _log_free_memory()
+            _raise_if_stopping()
+            _raise_if_held()
+
+            proc = await _spawn()
+            state.process = proc
+            state.start_time = time.monotonic()
+            # A ctx change that raced the spawn leaves the child on the old value.
+            state.pending_restart = state.ctx != state.ctx_active
+
+            ok, err = await _wait_ready(DS4_START_TIMEOUT)
+            if not ok:
+                log(f"ds4-server did not become ready: {err}")
+                await _terminate_process(proc)
+                state.process = None
+                state.ready = False
+                state.start_time = None
+                state.ctx_active = None
+                tail = _tail_log()
+                raise ServerStartError(
+                    f"ds4-server failed to become ready ({err}). Log tail:\n{tail}"
+                )
+
+            state.ready = True
             log(
-                f"previous ds4-server (pid={state.process.pid}) exited "
-                f"(code {state.process.returncode}); resetting state"
+                f"ds4-server ready after {time.monotonic() - state.start_time:.1f}s, "
+                f"pid={proc.pid}"
             )
-            state.process = None
-            state.ready = False
-            state.ctx_active = None
-
-        log("cold start requested: unloading oMLX models before starting ds4-server")
-        await _unload_omlx_models()
-        _log_free_memory()
-
-        proc = await _spawn()
-        state.process = proc
-        state.start_time = time.monotonic()
-        # A ctx change that raced the spawn leaves the child on the old value.
-        state.pending_restart = state.ctx != state.ctx_active
-
-        ok, err = await _wait_ready(DS4_START_TIMEOUT)
-        if not ok:
-            log(f"ds4-server did not become ready: {err}")
-            await _terminate_process(proc)
-            state.process = None
-            state.ready = False
-            state.start_time = None
-            state.ctx_active = None
-            tail = _tail_log()
-            raise ServerStartError(
-                f"ds4-server failed to become ready ({err}). Log tail:\n{tail}"
-            )
-
-        state.ready = True
-        log(
-            f"ds4-server ready after {time.monotonic() - state.start_time:.1f}s, "
-            f"pid={proc.pid}"
-        )
+    finally:
+        state.starting_count -= 1
 
 
 async def idle_watcher() -> None:
     while True:
         await asyncio.sleep(5)
         try:
+            _purge_holds()
             async with state.lock:
                 if state.ready and state.in_flight == 0 and state.pending_restart:
                     log("applying pending ctx change; stopping ds4-server")
@@ -949,12 +1206,54 @@ async def lifespan(app: FastAPI):
         log("shutting down: stopping ds4-server if running")
         if state.idle_task is not None:
             state.idle_task.cancel()
-        await stop_ds4_server()
+        await shutdown_stop_ds4()
         if state.http_client is not None:
             await state.http_client.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+def is_loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback
+
+
+class LoopbackOnlyAdminMiddleware:
+    """Pure ASGI middleware (no response buffering, so proxied SSE is
+    untouched): every /admin/* request must come from a loopback peer, else
+    403. Uses the socket peer address, never forwarded headers."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http":
+            path = "/" + scope.get("path", "").lstrip("/")
+            if path == "/admin" or path.startswith("/admin/"):
+                client = scope.get("client")
+                if not client or not is_loopback_host(client[0]):
+                    log(
+                        f"refused {scope.get('method')} {path} from "
+                        f"{client[0] if client else 'unknown'} (admin is loopback-only)"
+                    )
+                    resp = JSONResponse(
+                        {"error": "forbidden", "detail": "/admin is loopback-only"},
+                        status_code=403,
+                    )
+                    await resp(scope, receive, send)
+                    return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(LoopbackOnlyAdminMiddleware)
 
 
 @app.get("/v1/models")
@@ -984,6 +1283,8 @@ async def admin_status():
         remaining = max(0.0, DS4_IDLE_SECONDS - idle_for)
     return {
         "loaded": state.ready,
+        "starting": state.starting,
+        "holds": _active_holds(),
         "pid": state.process.pid if state.process is not None else None,
         "uptime_seconds": (
             (now - state.start_time) if (state.ready and state.start_time) else None
@@ -1068,17 +1369,69 @@ async def admin_config_set(request: Request):
 
 
 @app.post("/admin/stop")
-async def admin_stop():
-    await stop_ds4_server()
+async def admin_stop(if_idle: str = "0"):
+    """With ?if_idle=1: 409 instead of stopping while a request is in flight
+    or a cold start is in progress. Without it, always stops."""
+    try:
+        await stop_ds4_server(if_idle=if_idle.strip().lower() in ("1", "true", "yes"))
+    except BusyError:
+        return JSONResponse(
+            {
+                "error": "busy",
+                "in_flight": state.in_flight,
+                "starting": state.starting,
+            },
+            status_code=409,
+        )
     return {"status": "ok", "loaded": state.ready}
+
+
+@app.post("/admin/hold")
+async def admin_hold_create(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="body must be JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=400, detail='body must be {"reason": str, "ttl_s": int}'
+        )
+    reason = body.get("reason")
+    ttl = body.get("ttl_s")
+    if not isinstance(reason, str):
+        raise HTTPException(status_code=400, detail="reason must be a string")
+    if isinstance(ttl, bool) or not isinstance(ttl, int):
+        raise HTTPException(status_code=400, detail="ttl_s must be an integer")
+    if ttl < HOLD_TTL_MIN or ttl > HOLD_TTL_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"ttl_s must be between {HOLD_TTL_MIN} and {HOLD_TTL_MAX}",
+        )
+    _purge_holds()
+    hold_id = secrets.token_hex(8)
+    reason = reason.strip()[:200]
+    state.holds[hold_id] = {"reason": reason, "expires": time.monotonic() + ttl}
+    log(f"hold {hold_id} created: {reason!r} ttl={ttl}s")
+    return {"hold_id": hold_id}
+
+
+@app.delete("/admin/hold/{hold_id}")
+async def admin_hold_delete(hold_id: str):
+    _purge_holds()
+    if state.holds.pop(hold_id, None) is None:
+        raise HTTPException(status_code=404, detail="no such hold (released or expired)")
+    log(f"hold {hold_id} released")
+    return {"status": "ok", "released": hold_id}
 
 
 @app.post("/admin/start")
 async def admin_start():
     try:
         await ensure_started()
+    except ServerHeldError as e:
+        return _held_response(e)
     except ServerStartError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _start_http_error(e)
     return {
         "status": "ok",
         "loaded": state.ready,
@@ -1108,8 +1461,10 @@ async def proxy(full_path: str, request: Request):
     try:
         try:
             await ensure_started()
+        except ServerHeldError as e:
+            return _held_response(e)
         except ServerStartError as e:
-            raise HTTPException(status_code=503, detail=str(e))
+            raise _start_http_error(e)
 
         body = await request.body()
 
@@ -1204,6 +1559,9 @@ async def proxy(full_path: str, request: Request):
                     continue  # held until the whole body can carry timings
                 if chunk:
                     yield rewriter.feed(chunk) if rewriter is not None else chunk
+                if is_sse and state.stopping:
+                    log(f"shutting down: ending stream for {full_path}")
+                    break
             if sse_filter is not None:
                 tail = sse_filter.flush()
                 if tail:
@@ -1242,5 +1600,52 @@ async def proxy(full_path: str, request: Request):
     )
 
 
+ACCESS_LOG_QUIET_PATHS = {"/admin/status", "/v1/models", "/admin/config"}
+
+
+class AccessLogFilter(logging.Filter):
+    """Drops uvicorn access-log lines for the polled GET endpoints (/admin/status,
+    /v1/models, /admin/config); everything else is logged."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3:
+            method, target = args[1], str(args[2])
+            if method == "GET" and target.split("?", 1)[0] in ACCESS_LOG_QUIET_PATHS:
+                return False
+        return True
+
+
+def install_access_log_filter() -> None:
+    logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, AccessLogFilter) for f in logger.filters):
+        logger.addFilter(AccessLogFilter())
+
+
+class LauncherServer(uvicorn.Server):
+    """uvicorn.Server whose SIGTERM/SIGINT handler first raises state.stopping,
+    so open SSE streams end promptly and no cold start begins while the
+    lifespan stop runs."""
+
+    def handle_exit(self, sig, frame) -> None:
+        state.stopping = True
+        super().handle_exit(sig, frame)
+
+
+def build_server(host: str, port: int) -> LauncherServer:
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
+        # Peer address only: /admin loopback check must not trust X-Forwarded-For.
+        proxy_headers=False,
+    )
+    # After Config: its logging setup would not remove this, but be explicit.
+    install_access_log_filter()
+    return LauncherServer(config)
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host=DS4_ONDEMAND_HOST, port=DS4_ONDEMAND_PORT, log_level="info")
+    build_server(DS4_ONDEMAND_HOST, DS4_ONDEMAND_PORT).run()
