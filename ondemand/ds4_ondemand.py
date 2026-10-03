@@ -104,6 +104,8 @@ START_RETRY_AFTER = 15
 # ds4-server.log rotation.
 DS4_LOG_MAX_BYTES = 10 * 1024 * 1024
 DS4_LOG_BACKUPS = 3
+# StreamReader line limit for the child's output pipe (asyncio default: 64 KiB).
+DS4_PIPE_LINE_LIMIT = 8 * 1024 * 1024
 
 DS4_SAMPLING_INJECT = os.environ.get("DS4_SAMPLING_INJECT", "1") != "0"
 DS4_SAMPLING_DEFAULTS = os.environ.get("DS4_SAMPLING_DEFAULTS")
@@ -919,18 +921,30 @@ def _ds4_output_logger() -> logging.Logger:
 
 async def _pump_output(stream) -> None:
     """Copy the child's stdout/stderr into the rotating ds4-server.log until
-    EOF. Never raises."""
+    EOF. Must keep draining: a full pipe would block ds4-server on write(2).
+    An over-long line (ValueError from StreamReader.readline, which has
+    already discarded it) is noted once and skipped."""
     out = _ds4_output_logger()
-    try:
-        while True:
+    warned = False
+    while True:
+        try:
             line = await stream.readline()
-            if not line:
-                return
+        except asyncio.CancelledError:
+            raise
+        except ValueError as e:
+            if not warned:
+                warned = True
+                log(f"ds4-server output line over {DS4_PIPE_LINE_LIMIT} bytes dropped: {e}")
+            continue
+        except Exception as e:
+            log(f"ds4-server output pump stopped (non-fatal): {e}")
+            return
+        if not line:
+            return
+        try:
             out.info(line.decode("utf-8", errors="replace").rstrip("\r\n"))
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        log(f"ds4-server output pump stopped (non-fatal): {e}")
+        except Exception as e:
+            log(f"ds4-server log write failed (non-fatal): {e}")
 
 
 async def _spawn() -> asyncio.subprocess.Process:
@@ -967,6 +981,7 @@ async def _spawn() -> asyncio.subprocess.Process:
         cwd=str(DS4_WORKDIR),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        limit=DS4_PIPE_LINE_LIMIT,
     )
     if proc.stdout is not None:
         state.log_task = asyncio.create_task(_pump_output(proc.stdout))

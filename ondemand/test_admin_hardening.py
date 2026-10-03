@@ -869,6 +869,44 @@ class RotatingLogTest(unittest.TestCase):
         self.assertNotIn("\n\n", current)
         self.assertLessEqual(len(current.encode()), 200 + 100)
 
+    def test_pump_keeps_draining_after_an_overlong_line(self) -> None:
+        class Stream(FakeStream):
+            def __init__(self) -> None:
+                super().__init__([b"before\n", b"after\n", b"last\n"])
+                self.raised = False
+
+            async def readline(self) -> bytes:
+                if len(self._lines) == 2 and not self.raised:
+                    self.raised = True
+                    raise ValueError("Separator is not found, and chunk exceed the limit")
+                return await super().readline()
+
+        stream = Stream()
+        asyncio.run(od._pump_output(stream))
+        od._ds4_handler.flush()
+        self.assertTrue(stream.raised)
+        self.assertEqual(stream._lines, [])
+        self.assertEqual(od._tail_log(10), "before\nafter\nlast")
+
+    def test_pump_survives_a_failing_log_write(self) -> None:
+        out = od._ds4_output_logger()
+        calls = {"n": 0}
+        real = out.info
+
+        def flaky(msg):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("disk full")
+            real(msg)
+
+        out.info = flaky
+        try:
+            asyncio.run(od._pump_output(FakeStream([b"one\n", b"two\n"])))
+        finally:
+            del out.info
+        od._ds4_handler.flush()
+        self.assertEqual(od._tail_log(10), "two")
+
     def test_tail_log_reads_pumped_output(self) -> None:
         asyncio.run(od._pump_output(FakeStream([b"hello\n", b"world\r\n"])))
         od._ds4_handler.flush()
@@ -902,6 +940,7 @@ class RotatingLogTest(unittest.TestCase):
         od._ds4_handler.flush()
         self.assertEqual(captured["kwargs"]["stdout"], od.asyncio.subprocess.PIPE)
         self.assertEqual(captured["kwargs"]["stderr"], od.asyncio.subprocess.STDOUT)
+        self.assertEqual(captured["kwargs"]["limit"], od.DS4_PIPE_LINE_LIMIT)
         text = od.DS4_LOG_PATH.read_text()
         self.assertIn("ds4-ondemand spawn", text)
         self.assertIn("loading model", text)
